@@ -68,13 +68,22 @@ class 功能函数:
         return 错误
 
     def 模板匹配(self,匹配图片: bytes, 模板图片:bytes) -> Optional[Tuple[int, int]]:
-
-        结果: MatchResult | None=rustmatch.find_bytes(source=匹配图片,template=模板图片,threshold=0.9)
+        匹配图片=base64.b64decode(匹配图片)
+        结果: MatchResult | None=rustmatch.find_bytes(source=匹配图片,template=模板图片,threshold=0.7)
         if 结果 is None:
             raise  Exception("没有找到目标位置")
         # 结果.x 结果.y  左上角的xy位置
         return 结果.x,结果.y
 
+    def 模板匹配2(self,匹配图片_检测:bytes, 匹配图片_模板:bytes):
+
+        匹配图片_检测=base64.b64decode(匹配图片_检测)
+        匹配图片_模板=base64.b64decode(匹配图片_模板)
+        结果: MatchResult | None = rustmatch.find_bytes(source=匹配图片_检测,template=匹配图片_模板,threshold=0.7)
+        if 结果 is None:
+            raise  Exception("没有找到目标位置")
+        # 结果.x 结果.y  左上角的xy位置
+        return 结果.x,结果.y
 
     def AI文案(self, 提示词: str, 系统提示词: str = "你是一个专业的文案写作助手，请按用户要求生成文案，只输出文案内容。") -> str:
         提供方=self.配置数据["APItype"].strip().lower()
@@ -96,8 +105,6 @@ class 功能函数:
             return self.__模板表[名称]
         except KeyError:
             raise ValueError(f"未知的识别对象: {名称}") from None
-
-
 
     def __定时更新密钥(self) -> None:
         while True:
@@ -169,11 +176,12 @@ class 模板识别数据:
     class 功能:
         登录:Optional[bytes]=None
         同意圆圈:Optional[bytes]=None
-        签到图标:Optional[bytes]=None
+        黄色签到:Optional[bytes]=None
         全部: Optional[bytes] = None
         添加图片: Optional[bytes] = None
 
     class 每日签到:
+        签到:Optional[bytes]=None
         手动点击位置_1: Optional[bytes] = None
         手动点击位置_2: Optional[bytes] = None
         上传图片: Optional[bytes] = None
@@ -202,11 +210,10 @@ class See数据(BaseModel):
     识别对象:str
     Cookie密钥:str
 
-
-
-
-
-
+class 提交图片_数据(BaseModel):
+    模板图片:bytes
+    识别图片:bytes
+    Cookie密钥:str
 
 def 读取模板图片(图片路径: Path) -> bytes:
     if not 图片路径.is_file():
