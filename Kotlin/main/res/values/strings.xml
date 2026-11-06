@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">GongXueYunApp</string>
+    <string name="accessibility_service_label">工学云自动化服务</string>
+    <string name="accessibility_service_description">用于在自动化运行期间执行点击、滑动等手势操作，以及返回/主页等全局动作。</string>
+</resources>
