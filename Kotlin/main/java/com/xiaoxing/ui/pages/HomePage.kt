@@ -1,6 +1,7 @@
 package com.xiaoxing.ui.pages
 
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -9,9 +10,12 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -22,27 +26,31 @@ import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.DropdownMenu
-import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.listSaver
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.xiaoxing.AppRepository
 import com.xiaoxing.HintLevel
@@ -65,7 +73,7 @@ import kotlinx.coroutines.launch
  */
 @Composable
 internal fun HomePage(
-    onRequestStart: (workflowName: String) -> Unit,
+    onRequestStart: (workflowNames: List<String>) -> Unit,
     onStop: () -> Unit,
     onOpenServerSettings: () -> Unit,
     onOpenPermissions: () -> Unit,
@@ -85,14 +93,24 @@ internal fun HomePage(
     val overlayGranted by PermissionMonitor.overlayGranted.collectAsStateWithLifecycle()
     val batteryWhitelisted by PermissionMonitor.batteryWhitelisted.collectAsStateWithLifecycle()
 
-    var selectedName by rememberSaveable { mutableStateOf("") }
+    // 多选：列表顺序 = 执行顺序。ArrayList 经 listSaver 保存，旋转/切页后仍保留选择。
+    var selectedNames by rememberSaveable(
+        stateSaver = listSaver(
+            save = { it },
+            restore = { it },
+        ),
+    ) { mutableStateOf(emptyList<String>()) }
     LaunchedEffect(workflows) {
-        if (selectedName.isBlank() || selectedName !in workflows) {
-            selectedName = workflows.firstOrNull().orEmpty()
+        val stillValid = selectedNames.filter { it in workflows }
+        selectedNames = when {
+            workflows.isEmpty() -> emptyList()
+            stillValid.isEmpty() -> listOf(workflows.first())
+            stillValid.size != selectedNames.size -> stillValid
+            else -> selectedNames
         }
     }
 
-    val selectedSummary = summaries.firstOrNull { it.name == selectedName }
+    val selectedSummaries = summaries.filter { it.name in selectedNames }
 
     Column(
         modifier = Modifier
@@ -136,29 +154,38 @@ internal fun HomePage(
             modifier = Modifier.weight(6f),
             isRunning = isRunning,
             engineStatus = engineStatus,
-            selectedName = selectedName,
-            selectedSummary = selectedSummary,
+            selectedNames = selectedNames,
+            selectedSummaries = selectedSummaries,
             workflows = workflows,
             summaries = summaries,
             serverConfigured = server.isComplete,
             accessibilityEnabled = accessibilityEnabled,
-            onSelect = { selectedName = it },
+            onSelect = { selectedNames = it },
             onStart = {
                 PermissionMonitor.refresh(context)
                 val error = when {
                     !server.isComplete -> "请先在设置中配置服务器 IP 与端口"
-                    selectedName.isBlank() -> "请先选择要运行的工作流"
+                    selectedNames.isEmpty() -> "请先选择要运行的流程"
                     isRunning -> "已有自动化在运行"
                     !PermissionMonitor.accessibilityEnabled.value -> "请先开启无障碍服务"
-                    selectedSummary?.parseFailed == true -> "工作流文件无法解析，请重新编辑保存"
-                    selectedSummary?.stepCount == 0 -> "该工作流还没有步骤，请先添加步骤"
+                    selectedSummaries.any { it.parseFailed } ->
+                        "所选流程中有文件无法解析，请重新编辑保存"
+
+                    selectedSummaries.any { it.stepCount == 0 } ->
+                        "所选流程中有空流程，请先添加步骤"
+
                     else -> null
                 }
                 if (error != null) {
                     repo.showHint(error, HintLevel.WARNING)
                 } else {
-                    repo.showHint("等待投屏授权…（将捕获整个屏幕）", HintLevel.INFO)
-                    onRequestStart(selectedName)
+                    val target = if (selectedNames.size > 1) {
+                        " ${selectedNames.size} 条流程"
+                    } else {
+                        "工作流"
+                    }
+                    repo.showHint("等待投屏授权…（将执行$target，捕获整个屏幕）", HintLevel.INFO)
+                    onRequestStart(selectedNames)
                 }
             },
             onStop = {
@@ -297,23 +324,22 @@ private fun PermissionsBlock(
 private fun ControlBlock(
     isRunning: Boolean,
     engineStatus: String,
-    selectedName: String,
-    selectedSummary: WorkflowSummary?,
+    selectedNames: List<String>,
+    selectedSummaries: List<WorkflowSummary>,
     workflows: List<String>,
     summaries: List<WorkflowSummary>,
     serverConfigured: Boolean,
     accessibilityEnabled: Boolean,
-    onSelect: (String) -> Unit,
+    onSelect: (List<String>) -> Unit,
     onStart: () -> Unit,
     onStop: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val workflowReady = selectedSummary != null &&
-        selectedSummary.stepCount > 0 &&
-        !selectedSummary.parseFailed
+    val workflowReady = selectedSummaries.isNotEmpty() &&
+        selectedSummaries.all { it.stepCount > 0 && !it.parseFailed }
     val idleHint = when {
         !serverConfigured -> "下一步：在设置中填写服务器 IP 与端口"
-        !workflowReady -> "下一步：添加一条包含步骤的工作流"
+        !workflowReady -> "下一步：选择一条包含步骤的流程"
         !accessibilityEnabled -> "下一步：在设置中开启无障碍服务"
         else -> "一切就绪，点击启动后按提示完成投屏授权"
     }
@@ -329,7 +355,13 @@ private fun ControlBlock(
                     Text("自动化控制", style = MaterialTheme.typography.titleLarge)
                     Spacer(Modifier.height(2.dp))
                     Text(
-                        if (isRunning) "任务正在执行，请保持投屏共享" else "选择一条流程，然后开始",
+                        when {
+                            isRunning && selectedNames.size > 1 ->
+                                "正在依次执行 ${selectedNames.size} 条流程，请保持投屏共享"
+
+                            isRunning -> "任务正在执行，请保持投屏共享"
+                            else -> "可勾选多条流程，按顺序依次执行"
+                        },
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                         maxLines = 1,
@@ -344,8 +376,7 @@ private fun ControlBlock(
 
             Spacer(Modifier.height(16.dp))
             WorkflowSelector(
-                selectedName = selectedName,
-                selectedSummary = selectedSummary,
+                selectedNames = selectedNames,
                 workflows = workflows,
                 summaries = summaries,
                 enabled = !isRunning,
@@ -354,17 +385,14 @@ private fun ControlBlock(
 
             Spacer(Modifier.height(10.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                if (selectedSummary == null) {
-                    MetaChip("暂无工作流")
-                } else {
-                    MetaChip("${selectedSummary.stepCount} 个步骤")
-                    MetaChip(
-                        selectedSummary.targetPackage
-                            .takeIf { it.isNotBlank() }
-                            ?.substringAfterLast('.')
-                            ?: "未指定目标应用",
-                    )
-                    if (selectedSummary.parseFailed) MetaChip("文件异常")
+                when {
+                    workflows.isEmpty() -> MetaChip("暂无工作流")
+                    selectedSummaries.isEmpty() -> MetaChip("未选择流程")
+                    else -> {
+                        MetaChip("${selectedSummaries.size} 条流程")
+                        MetaChip("共 ${selectedSummaries.sumOf { it.stepCount }} 个步骤")
+                        if (selectedSummaries.any { it.parseFailed }) MetaChip("文件异常")
+                    }
                 }
             }
 
@@ -432,104 +460,249 @@ private fun ControlBlock(
 
 @Composable
 private fun WorkflowSelector(
-    selectedName: String,
-    selectedSummary: WorkflowSummary?,
+    selectedNames: List<String>,
     workflows: List<String>,
     summaries: List<WorkflowSummary>,
     enabled: Boolean,
-    onSelect: (String) -> Unit,
+    onSelect: (List<String>) -> Unit,
 ) {
-    var expanded by remember { mutableStateOf(false) }
+    var showPicker by remember { mutableStateOf(false) }
+    val selectedSteps = summaries.filter { it.name in selectedNames }.sumOf { it.stepCount }
     val subtitle = when {
         !enabled -> "运行中不可切换，请先停止"
-        selectedName.isBlank() -> "还没有可运行的流程"
-        selectedSummary == null -> "正在读取流程信息…"
-        selectedSummary.targetPackage.isBlank() -> "未指定目标应用 · ${selectedSummary.stepCount} 个步骤"
-        else -> "${selectedSummary.targetPackage} · ${selectedSummary.stepCount} 个步骤"
+        workflows.isEmpty() -> "还没有可运行的流程"
+        selectedNames.isEmpty() -> "点按勾选要执行的流程"
+        selectedNames.size == 1 -> "共 $selectedSteps 个步骤"
+        else -> "${selectedNames.size} 条流程 · 按勾选顺序依次执行"
     }
 
     Column(verticalArrangement = Arrangement.spacedBy(7.dp)) {
-        Text(
-            "执行工作流",
-            style = MaterialTheme.typography.labelMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-        Box {
-            Surface(
-                onClick = { expanded = true },
-                enabled = enabled,
-                shape = RoundedCornerShape(18.dp),
-                color = MaterialTheme.colorScheme.surfaceContainerLow,
-                border = BorderStroke(
-                    1.dp,
-                    if (expanded) MaterialTheme.colorScheme.primary.copy(alpha = 0.65f)
-                    else MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.8f),
-                ),
-                modifier = Modifier.fillMaxWidth(),
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                "执行工作流",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(Modifier.weight(1f))
+            if (selectedNames.size > 1) {
+                Text(
+                    "按顺序执行",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.primary,
+                )
+            }
+        }
+        Surface(
+            onClick = { if (enabled) showPicker = true },
+            enabled = enabled,
+            shape = RoundedCornerShape(18.dp),
+            color = MaterialTheme.colorScheme.surfaceContainerLow,
+            border = BorderStroke(
+                1.dp,
+                if (showPicker) MaterialTheme.colorScheme.primary.copy(alpha = 0.65f)
+                else MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.8f),
+            ),
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Row(
+                modifier = Modifier.padding(horizontal = 13.dp, vertical = 11.dp),
+                verticalAlignment = Alignment.CenterVertically,
             ) {
-                Row(
-                    modifier = Modifier.padding(horizontal = 13.dp, vertical = 11.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    IconPlate(
-                        icon = Icons.AutoMirrored.Filled.List,
-                        size = 38,
+                IconPlate(
+                    icon = Icons.AutoMirrored.Filled.List,
+                    size = 38,
+                )
+                Spacer(Modifier.width(12.dp))
+                Column(Modifier.weight(1f)) {
+                    Text(
+                        selectedNames.joinToString("、").ifBlank { "选择工作流" },
+                        style = MaterialTheme.typography.titleMedium,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
                     )
-                    Spacer(Modifier.width(12.dp))
+                    Spacer(Modifier.height(2.dp))
+                    Text(
+                        subtitle,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+                Icon(
+                    Icons.Filled.KeyboardArrowDown,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.size(22.dp),
+                )
+            }
+        }
+    }
+
+    if (showPicker) {
+        WorkflowPickerDialog(
+            selected = selectedNames,
+            workflows = workflows,
+            summaries = summaries,
+            onDismiss = { showPicker = false },
+            onConfirm = {
+                onSelect(it)
+                showPicker = false
+            },
+        )
+    }
+}
+
+/**
+ * 多流程选择：勾选顺序即执行顺序（右侧序号）。
+ * 选择结果在点「执行所选」时才写回，取消不会改动现有选择。
+ */
+@Composable
+private fun WorkflowPickerDialog(
+    selected: List<String>,
+    workflows: List<String>,
+    summaries: List<WorkflowSummary>,
+    onDismiss: () -> Unit,
+    onConfirm: (List<String>) -> Unit,
+) {
+    var draft by remember(selected) { mutableStateOf(selected) }
+
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false),
+    ) {
+        Surface(
+            modifier = Modifier
+                .fillMaxWidth(0.92f)
+                .heightIn(max = 580.dp),
+            shape = RoundedCornerShape(28.dp),
+            color = MaterialTheme.colorScheme.surfaceContainerLow,
+            border = BorderStroke(
+                1.dp,
+                MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.7f),
+            ),
+        ) {
+            Column(
+                modifier = Modifier.padding(20.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
                     Column(Modifier.weight(1f)) {
+                        Text("选择执行流程", style = MaterialTheme.typography.titleLarge)
                         Text(
-                            selectedName.ifBlank { "选择工作流" },
-                            style = MaterialTheme.typography.titleMedium,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                        Spacer(Modifier.height(2.dp))
-                        Text(
-                            subtitle,
+                            "勾选顺序即执行顺序 · 已选 ${draft.size} 条",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
                         )
                     }
-                    Icon(
-                        Icons.Filled.KeyboardArrowDown,
-                        contentDescription = null,
-                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.size(22.dp),
+                    TextButton(onClick = { draft = workflows }) { Text("全选") }
+                    TextButton(onClick = { draft = emptyList() }) { Text("清空") }
+                }
+
+                if (workflows.isEmpty()) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(150.dp),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        Text(
+                            "暂无工作流，请到「流程」页添加",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                } else {
+                    LazyColumn(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(max = 380.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        items(workflows, key = { it }) { name ->
+                            val order = draft.indexOf(name)
+                            WorkflowPickRow(
+                                name = name,
+                                summary = summaries.firstOrNull { it.name == name },
+                                order = order,
+                                onClick = {
+                                    draft = if (order >= 0) {
+                                        draft - name
+                                    } else {
+                                        draft + name
+                                    }
+                                },
+                            )
+                        }
+                    }
+                }
+
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        "${draft.size} 条流程",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
+                    Spacer(Modifier.weight(1f))
+                    TextButton(onClick = onDismiss) { Text("取消") }
+                    Button(
+                        onClick = { onConfirm(draft) },
+                        enabled = draft.isNotEmpty(),
+                    ) { Text("执行所选") }
                 }
             }
-            DropdownMenu(
-                expanded = expanded,
-                onDismissRequest = { expanded = false },
-                shape = RoundedCornerShape(18.dp),
-                containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
-            ) {
-                if (workflows.isEmpty()) {
-                    DropdownMenuItem(
-                        text = { Text("暂无工作流，请到「流程」页添加") },
-                        onClick = { expanded = false },
-                        enabled = false,
-                    )
-                }
-                workflows.forEach { name ->
-                    val summary = summaries.firstOrNull { it.name == name }
-                    DropdownMenuItem(
-                        text = {
-                            Column {
-                                Text(name, style = MaterialTheme.typography.bodyMedium)
-                                Text(
-                                    "${summary?.stepCount ?: 0} 个步骤",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                )
-                            }
-                        },
-                        onClick = {
-                            onSelect(name)
-                            expanded = false
-                        },
+        }
+    }
+}
+
+@Composable
+private fun WorkflowPickRow(
+    name: String,
+    summary: WorkflowSummary?,
+    order: Int,
+    onClick: () -> Unit,
+) {
+    val scheme = MaterialTheme.colorScheme
+    val picked = order >= 0
+    Surface(
+        onClick = onClick,
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(14.dp),
+        color = if (picked) scheme.primary.copy(alpha = 0.10f) else Color.Transparent,
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Checkbox(checked = picked, onCheckedChange = null)
+            Spacer(Modifier.width(8.dp))
+            Column(Modifier.weight(1f)) {
+                Text(
+                    name,
+                    style = MaterialTheme.typography.bodyLarge,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Text(
+                    buildString {
+                        append("${summary?.stepCount ?: 0} 个步骤")
+                        if (summary?.parseFailed == true) append(" · 文件异常")
+                    },
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            if (picked) {
+                Box(
+                    modifier = Modifier
+                        .size(24.dp)
+                        .background(scheme.primary, CircleShape),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Text(
+                        "${order + 1}",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = scheme.onPrimary,
                     )
                 }
             }

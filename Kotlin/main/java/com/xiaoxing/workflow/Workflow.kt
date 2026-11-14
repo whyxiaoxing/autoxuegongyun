@@ -33,6 +33,18 @@ object TemplateRegistry {
 /** 模板匹配点击偏移的绝对值上限（像素），编辑页与校验共用 */
 const val CLICK_OFFSET_LIMIT = 200
 
+/** 整条流程失败后的最大重复次数（首次执行不计入），编辑页与校验共用 */
+const val MAX_FAILURE_RETRIES = 10
+
+/** IF 条件类型：服务端模板匹配（/See） */
+const val IF_CONDITION_MATCH = "match"
+
+/** IF 条件类型：本地图片模板匹配（/See_Submit_Photo） */
+const val IF_CONDITION_PHOTO = "photoMatch"
+
+/** IF 条件类型：屏幕文字识别（/OCRPhoto） */
+const val IF_CONDITION_OCR = "ocr"
+
 /** 工作流步骤：JSON 以 "type" 字段区分（classDiscriminator） */
 @Serializable
 sealed class Step {
@@ -132,6 +144,9 @@ data class AiTextStep(
 /**
  * 本地图片模板匹配：截屏后把「本机导入的模板图片」与截图一起提交到 `/See_Submit_Photo`，
  * 服务端不查 Photo/ 模板表，模板完全由用户在本机维护。
+ *
+ * @property offsetX 命中点横向偏移（像素，±200 内），用于微调模板左上角换算出的点击位置
+ * @property offsetY 命中点纵向偏移（像素，±200 内）
  */
 @Serializable
 @SerialName("photoMatch")
@@ -139,6 +154,57 @@ data class PhotoMatchStep(
     val template: String,
     val tap: Boolean = true,
     val timeoutMs: Long = 10000,
+    @SerialName("offsetX") val offsetX: Int = 0,
+    @SerialName("offsetY") val offsetY: Int = 0,
+    override val optional: Boolean = false,
+) : Step()
+
+/**
+ * 条件分支（IF）：条件 = 「模板匹配」「图片匹配」或「文字识别」是否成功（只判断命中，不点击）。
+ *
+ * 语义与代码里的 `if` 一致：
+ *  - [condition] = [IF_CONDITION_MATCH]：截屏 → `/See` 匹配服务端模板 [template]；
+ *  - [condition] = [IF_CONDITION_PHOTO]：截屏 → `/See_Submit_Photo` 匹配本地图片模板 [template]；
+ *  - [condition] = [IF_CONDITION_OCR]：截屏 → `/OCRPhoto` 查找 [keyword]（服务端过滤）；
+ *  - timeoutMs 内命中 → 执行 [thenSteps]；超时未命中（或请求一直失败）→ 执行 [elseSteps]。
+ *
+ * [optional] 只作用于块内步骤：块内任一非可选步骤失败时，可选块会跳过剩余步骤并继续执行后续流程；
+ * 非可选块则中止整条流程，并像普通步骤失败一样触发工作流的「失败重复次数」。
+ */
+@Serializable
+@SerialName("if")
+data class IfStep(
+    /** 条件类型：[IF_CONDITION_MATCH]（服务端模板）/ [IF_CONDITION_PHOTO]（本地图片模板）/ [IF_CONDITION_OCR]（文字识别） */
+    val condition: String = IF_CONDITION_MATCH,
+    /** 条件模板名（服务端 Photo/ 名称或本机模板名，随 [condition] 而定；OCR 条件不使用） */
+    val template: String = "",
+    /** OCR 条件要查找的文字（由服务端 /OCRPhoto 按目标文字过滤；仅 [IF_CONDITION_OCR] 使用） */
+    val keyword: String = "",
+    val timeoutMs: Long = 10000,
+    /** 条件成立时执行的步骤 */
+    @SerialName("thenSteps") val thenSteps: List<Step> = emptyList(),
+    /** 条件不成立时执行的步骤 */
+    @SerialName("elseSteps") val elseSteps: List<Step> = emptyList(),
+    override val optional: Boolean = false,
+) : Step()
+
+/**
+ * 屏幕文字识别：截屏 → `POST /OCRPhoto`（目标文字随请求提交）返回 `{文字: [centerX, centerY]}`。
+ *
+ * 在 timeoutMs 内轮询，服务端返回命中 [keyword] 的文字后（默认）点击该文字中心坐标。
+ *
+ * @property offsetX 命中点横向偏移（像素，±200 内），用于微调文字中心换算出的点击位置
+ * @property offsetY 命中点纵向偏移（像素，±200 内）
+ */
+@Serializable
+@SerialName("ocr")
+data class OcrStep(
+    /** 要查找的文字（随 /OCRPhoto 提交，由服务端按目标文字过滤） */
+    val keyword: String,
+    val tap: Boolean = true,
+    val timeoutMs: Long = 10000,
+    @SerialName("offsetX") val offsetX: Int = 0,
+    @SerialName("offsetY") val offsetY: Int = 0,
     override val optional: Boolean = false,
 ) : Step()
 
@@ -154,6 +220,11 @@ data class Workflow(
     @SerialName("intervalMs") val intervalMs: Long = 1000,
     /** 动作类步骤（tap/swipe/input/global/launch）重试次数（在「启动应用」步骤面板里编辑） */
     @SerialName("maxRetries") val maxRetries: Int = 3,
+    /**
+     * 整条流程失败后的重复次数（在功能库「流程控制」里编辑）。
+     * 非可选步骤失败导致流程中止时，从头再执行整条流程；0 = 失败即停止。
+     */
+    @SerialName("failureRetries") val failureRetries: Int = 0,
     val steps: List<Step> = emptyList(),
 )
 
@@ -169,13 +240,29 @@ val Workflow.effectiveTargetPackage: String
         val raw = targetPackage.trim()
         val workflowTarget = if (raw == SKELETON_PLACEHOLDER_PKG) "" else raw
         return workflowTarget.ifBlank {
-            steps.filterIsInstance<LaunchStep>()
+            steps.flattenSteps().filterIsInstance<LaunchStep>()
                 .firstOrNull { it.packageName.isNotBlank() }
                 ?.packageName
                 ?.trim()
                 .orEmpty()
         }
     }
+
+/**
+ * 深度展开步骤：IF 的两个分支会展开到同一列表（块本身保留在最前）。
+ *
+ * 初始化预检（模板/截屏/无障碍/目标 App）和校验都基于展开后的列表，
+ * 避免嵌套在控制流里的步骤绕过依赖检查。
+ */
+fun List<Step>.flattenSteps(): List<Step> = flatMap { step ->
+    listOf(step) + when (step) {
+        is IfStep -> step.thenSteps.flattenSteps() + step.elseSteps.flattenSteps()
+        is MatchStep, is PhotoMatchStep, is AiTextStep, is LaunchStep, is WaitStep,
+        is TapStep, is SwipeStep, is InputTextStep, is GlobalActionStep,
+        is SaveScreenshotStep, is OcrStep,
+        -> emptyList()
+    }
+}
 
 object WorkflowCodec {
     val json: Json = Json {
@@ -204,36 +291,91 @@ object WorkflowCodec {
     fun validate(workflow: Workflow): List<String> = buildList {
         if (workflow.name.isBlank()) add("name 不能为空")
         if (workflow.steps.isEmpty()) add("steps 不能为空")
-        workflow.steps.forEachIndexed { index, step ->
+        if (workflow.failureRetries !in 0..MAX_FAILURE_RETRIES) {
+            add("failureRetries 需在 0..$MAX_FAILURE_RETRIES 之间（失败后整条流程重复次数）")
+        }
+        validateSteps(workflow.steps, "步骤")
+    }
+
+    /** 递归校验（含 IF 块内步骤）；[path] 用于在错误文案里标出嵌套位置 */
+    private fun MutableList<String>.validateSteps(steps: List<Step>, path: String) {
+        steps.forEachIndexed { index, step ->
+            val label = "$path#$index"
             when (step) {
                 is MatchStep -> {
-                    if (step.template.isBlank()) add("步骤#$index: 模板名为空")
+                    if (step.template.isBlank()) add("$label: 模板名为空")
                     // 只在已从服务端取到模板列表时校验，离线时不误伤已有工作流
                     if (TemplateRegistry.isLoaded && step.template !in TemplateRegistry.known) {
-                        add("步骤#$index: 未知模板「${step.template}」（服务端未注册）")
+                        add("$label: 未知模板「${step.template}」（服务端未注册）")
                     }
                     if (step.offsetX !in -CLICK_OFFSET_LIMIT..CLICK_OFFSET_LIMIT ||
                         step.offsetY !in -CLICK_OFFSET_LIMIT..CLICK_OFFSET_LIMIT
                     ) {
-                        add("步骤#$index: 点击偏移需在 ±$CLICK_OFFSET_LIMIT 像素以内")
+                        add("$label: 点击偏移需在 ±$CLICK_OFFSET_LIMIT 像素以内")
                     }
                 }
 
                 is GlobalActionStep ->
-                    if (step.action.lowercase() !in setOf("back", "home")) add("步骤#$index: 未知全局动作「${step.action}」")
+                    if (step.action.lowercase() !in setOf("back", "home")) add("$label: 未知全局动作「${step.action}」")
 
                 is AiTextStep -> {
                     if (step.sections.isEmpty() && step.instruction.isBlank()) {
-                        add("步骤#$index: AI 文案至少选择一段身份信息或填写补充要求")
+                        add("$label: AI 文案至少选择一段身份信息或填写补充要求")
                     }
                     val unknown = step.sections.filter { IdentitySections.find(it) == null }
-                    if (unknown.isNotEmpty()) add("步骤#$index: 未知身份信息段 ${unknown.joinToString()}")
+                    if (unknown.isNotEmpty()) add("$label: 未知身份信息段 ${unknown.joinToString()}")
                 }
 
-                is PhotoMatchStep ->
-                    if (step.template.isBlank()) add("步骤#$index: 本地图片模板不能为空")
+                is PhotoMatchStep -> {
+                    if (step.template.isBlank()) add("$label: 本地图片模板不能为空")
+                    if (step.offsetX !in -CLICK_OFFSET_LIMIT..CLICK_OFFSET_LIMIT ||
+                        step.offsetY !in -CLICK_OFFSET_LIMIT..CLICK_OFFSET_LIMIT
+                    ) {
+                        add("$label: 点击偏移需在 ±$CLICK_OFFSET_LIMIT 像素以内")
+                    }
+                }
 
-                else -> Unit
+                is OcrStep -> {
+                    if (step.keyword.isBlank()) add("$label: OCR 识别文字不能为空")
+                    if (step.offsetX !in -CLICK_OFFSET_LIMIT..CLICK_OFFSET_LIMIT ||
+                        step.offsetY !in -CLICK_OFFSET_LIMIT..CLICK_OFFSET_LIMIT
+                    ) {
+                        add("$label: 点击偏移需在 ±$CLICK_OFFSET_LIMIT 像素以内")
+                    }
+                }
+
+                is IfStep -> {
+                    when (step.condition) {
+                        IF_CONDITION_MATCH, IF_CONDITION_PHOTO, IF_CONDITION_OCR -> Unit
+                        else -> add("$label: 未知 IF 条件类型「${step.condition}」")
+                    }
+                    when (step.condition) {
+                        IF_CONDITION_PHOTO ->
+                            if (step.template.isBlank()) add("$label: IF 条件图片模板不能为空")
+
+                        IF_CONDITION_MATCH ->
+                            if (step.template.isBlank()) add("$label: IF 条件模板不能为空")
+
+                        IF_CONDITION_OCR ->
+                            if (step.keyword.isBlank()) add("$label: IF 条件识别文字不能为空")
+
+                        else -> Unit
+                    }
+                    if (
+                        step.condition == IF_CONDITION_MATCH &&
+                        TemplateRegistry.isLoaded &&
+                        step.template.isNotBlank() &&
+                        step.template !in TemplateRegistry.known
+                    ) {
+                        add("$label: 未知模板「${step.template}」（服务端未注册）")
+                    }
+                    validateSteps(step.thenSteps, "$label IF 成立分支")
+                    validateSteps(step.elseSteps, "$label IF 否则分支")
+                }
+
+                is LaunchStep, is WaitStep, is TapStep, is SwipeStep, is InputTextStep,
+                is GlobalActionStep, is SaveScreenshotStep,
+                -> Unit
             }
         }
     }

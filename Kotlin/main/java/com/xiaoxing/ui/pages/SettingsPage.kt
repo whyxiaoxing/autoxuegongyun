@@ -17,6 +17,7 @@ import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.Build
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Lock
+import androidx.compose.material.icons.filled.Notifications
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Search
@@ -52,6 +53,7 @@ internal enum class SettingsDestination(val key: String, val title: String) {
     PHOTO("photo", "本地模板"),
     PERMISSIONS("permissions", "权限管理"),
     AUTOMATION("automation", "自动化选项"),
+    ALERTS("alerts", "失败提醒"),
     APPEARANCE("appearance", "外观主题"),
     ABOUT("about", "关于"),
 }
@@ -66,6 +68,7 @@ internal fun SettingsPage(onOpen: (SettingsDestination) -> Unit) {
     val confidence by AppRepository.matchConfidence.collectAsStateWithLifecycle()
     val identity by AppRepository.identityInfo.collectAsStateWithLifecycle()
     val themeMode by AppRepository.themeMode.collectAsStateWithLifecycle()
+    val alertSettings by AppRepository.failureAlertSettings.collectAsStateWithLifecycle()
 
     val grantedCount = listOf(accessibilityEnabled, overlayGranted, batteryWhitelisted).count { it }
     val serverStatus = when {
@@ -79,6 +82,17 @@ internal fun SettingsPage(onOpen: (SettingsDestination) -> Unit) {
         connection == ServerConnectionState.ONLINE -> AppTheme.extended.success
         connection == ServerConnectionState.OFFLINE -> MaterialTheme.colorScheme.error
         else -> MaterialTheme.colorScheme.onSurfaceVariant
+    }
+    val alertStatus = when {
+        !alertSettings.vibrationEnabled && !alertSettings.ringtoneEnabled -> "已关闭"
+        alertSettings.vibrationEnabled && alertSettings.ringtoneEnabled -> "震动 + 铃声"
+        alertSettings.ringtoneEnabled -> "仅铃声"
+        else -> "仅震动"
+    }
+    val alertStatusColor = if (!alertSettings.vibrationEnabled && !alertSettings.ringtoneEnabled) {
+        MaterialTheme.colorScheme.onSurfaceVariant
+    } else {
+        AppTheme.extended.success
     }
 
     LazyColumn(
@@ -134,6 +148,16 @@ internal fun SettingsPage(onOpen: (SettingsDestination) -> Unit) {
                             accent = MaterialTheme.colorScheme.secondary,
                             trailingText = "置信度 ${(confidence * 100).roundToInt()}%",
                             onClick = { onOpen(SettingsDestination.AUTOMATION) },
+                        )
+                        AppDivider(Modifier.padding(start = 68.dp))
+                        SettingsEntry(
+                            icon = Icons.Filled.Notifications,
+                            title = "失败提醒",
+                            subtitle = "流程失败后的震动与提示铃声",
+                            accent = MaterialTheme.colorScheme.tertiary,
+                            trailingText = alertStatus,
+                            trailingColor = alertStatusColor,
+                            onClick = { onOpen(SettingsDestination.ALERTS) },
                         )
                     }
                 }

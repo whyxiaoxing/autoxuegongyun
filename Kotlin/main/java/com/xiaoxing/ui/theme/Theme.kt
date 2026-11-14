@@ -2,6 +2,7 @@ package com.xiaoxing.ui.theme
 
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Shapes
 import androidx.compose.material3.darkColorScheme
@@ -101,7 +102,14 @@ fun GongXueYunAppTheme(
     val colorScheme = if (darkTheme) DarkColorScheme else LightColorScheme
     val extendedColors = if (darkTheme) DarkExtendedColors else LightExtendedColors
 
-    CompositionLocalProvider(LocalExtendedColors provides extendedColors) {
+    // Material3 的 contentColorFor 不识别 surfaceContainer* / Color.Transparent：
+    // 这些容器里的默认文字会回退到 LocalContentColor。CompositionLocal 的默认值是纯黑，
+    // 深色主题下（对话框、BottomSheet、透明 Surface 里的行）就会变成黑底黑字。
+    // 在主题根节点提供 onBackground，让所有未显式指定颜色的文字/图标在两种主题下都可读。
+    CompositionLocalProvider(
+        LocalExtendedColors provides extendedColors,
+        LocalContentColor provides colorScheme.onBackground,
+    ) {
         MaterialTheme(
             colorScheme = colorScheme,
             typography = AppTypography,

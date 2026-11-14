@@ -6,6 +6,7 @@ import androidx.compose.runtime.Immutable
 import com.xiaoxing.accessibility.ClickEffectOverlay
 import com.xiaoxing.capture.ScreenCaptureManager
 import com.xiaoxing.config.DEFAULT_MATCH_CONFIDENCE
+import com.xiaoxing.config.FailureAlertSettings
 import com.xiaoxing.config.IdentityInfo
 import com.xiaoxing.config.MATCH_CONFIDENCE_RANGE
 import com.xiaoxing.config.OssConfig
@@ -14,6 +15,7 @@ import com.xiaoxing.config.SettingsStore
 import com.xiaoxing.config.ThemeMode
 import com.xiaoxing.concurrent.AppExecutors
 import com.xiaoxing.network.AiTextClient
+import com.xiaoxing.network.OcrClient
 import com.xiaoxing.network.SeeClient
 import com.xiaoxing.network.TemplateNameClient
 import com.xiaoxing.network.TokenManager
@@ -111,6 +113,9 @@ object AppRepository {
     /** 「跳过投屏二次确认」：不等待通知栏「继续共享」确认直接执行（页面开关，默认关） */
     val skipProjectionConfirm = MutableStateFlow(false)
 
+    /** 失败提醒：震动/铃声开关与自定义铃声（「提醒」一级导航页可调） */
+    val failureAlertSettings = MutableStateFlow(FailureAlertSettings())
+
     /** 识别模板名（服务端 /GetMatchName；刷新按钮走 /UpdataPhotoName） */
     val templateNames = MutableStateFlow<List<String>>(emptyList())
     val templateNamesLoading = MutableStateFlow(false)
@@ -142,6 +147,7 @@ object AppRepository {
         ) { serverConfig.value.baseUrl }
     }
     val aiTextClient by lazy { AiTextClient(tokenManager) { serverConfig.value.baseUrl } }
+    val ocrClient by lazy { OcrClient(tokenManager) { serverConfig.value.baseUrl } }
     val templateNameClient by lazy {
         TemplateNameClient(tokenManager) { serverConfig.value.baseUrl }
     }
@@ -178,6 +184,9 @@ object AppRepository {
         scope.launch { SettingsStore.clickEffect.collect { clickEffect.value = it } }
         scope.launch {
             SettingsStore.skipProjectionConfirm.collect { skipProjectionConfirm.value = it }
+        }
+        scope.launch {
+            SettingsStore.failureAlertSettings.collect { failureAlertSettings.value = it }
         }
         scope.launch { SettingsStore.matchConfidence.collect { matchConfidence.value = it } }
         scope.launch { SettingsStore.themeMode.collect { themeMode.value = it } }
@@ -344,6 +353,22 @@ object AppRepository {
     suspend fun setSkipProjectionConfirm(value: Boolean) {
         SettingsStore.saveSkipProjectionConfirm(value)
         skipProjectionConfirm.value = value
+    }
+
+    suspend fun setFailureVibration(value: Boolean) {
+        SettingsStore.saveFailureVibration(value)
+        failureAlertSettings.value = failureAlertSettings.value.copy(vibrationEnabled = value)
+    }
+
+    suspend fun setFailureRingtone(value: Boolean) {
+        SettingsStore.saveFailureRingtone(value)
+        failureAlertSettings.value = failureAlertSettings.value.copy(ringtoneEnabled = value)
+    }
+
+    suspend fun setFailureRingtoneUri(uri: String) {
+        val trimmed = uri.trim()
+        SettingsStore.saveFailureRingtoneUri(trimmed)
+        failureAlertSettings.value = failureAlertSettings.value.copy(ringtoneUri = trimmed)
     }
 
     suspend fun setMatchConfidence(value: Float) {

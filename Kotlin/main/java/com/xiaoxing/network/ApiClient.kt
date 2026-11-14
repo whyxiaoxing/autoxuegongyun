@@ -40,6 +40,23 @@ private data class SubmitPhotoRequest(
     @SerialName("置信度") val confidence: Float,
 )
 
+/**
+ * /OCRPhoto：服务端按 `目标文字` 过滤 OCR 结果，请求体自带 Cookie 密钥（与 /See 一致）。
+ * `识别图片` 与 SeeRequest 一样是 PNG 的 Base64 文本；`PSM` 是 Tesseract 页面分割模式。
+ */
+@Serializable
+private data class OcrRequest(
+    @SerialName("识别图片") val imageBase64: String,
+    @SerialName("目标文字") val targetText: String,
+    @SerialName("置信度") val confidence: Float,
+    @SerialName("PSM") val psm: Int,
+    @SerialName("Cookie密钥") val cookieKey: String,
+)
+
+/** /OCRPhoto：result 为 `{识别文字: [centerX, centerY]}`（只包含命中目标文字的条目） */
+@Serializable
+private data class OcrResponse(@SerialName("result") val result: Map<String, List<Int>>? = null)
+
 @Serializable
 private data class ApiMessage(@SerialName("message") val message: String? = null)
 
@@ -79,6 +96,15 @@ object ApiClient {
         .readTimeout(600, TimeUnit.SECONDS)
         .writeTimeout(60, TimeUnit.SECONDS)
         .callTimeout(620, TimeUnit.SECONDS)
+        .build()
+
+    /**
+     * OCR 专用客户端：/OCRPhoto 内部给 Tesseract 的超时是 120 秒（main.py），
+     * 普通 /See 的 30s 不够，又不该像 AI 文案那样等 10 分钟，单独给 130 秒读超时。
+     */
+    val ocrHttp: OkHttpClient = http.newBuilder()
+        .readTimeout(130, TimeUnit.SECONDS)
+        .callTimeout(140, TimeUnit.SECONDS)
         .build()
 }
 
@@ -394,4 +420,89 @@ class AiTextClient(
         }
         throw IllegalStateException("unreachable")
     }
+}
+
+/**
+ * `POST /OCRPhoto`：请求体是 JSON（`OCR识别_提交数据`），字段与 `main.py` 一致：
+ * `识别图片`（PNG 的 Base64）、`目标文字`、`置信度`、`PSM`、`Cookie密钥`。
+ * 服务端用 Tesseract 只返回匹配目标文字的条目 `{识别文字: [centerX, centerY]}`。
+ *
+ * - `PSM` 固定 [DEFAULT_PSM]（稀疏文字，适合界面截图，与服务端 OCR_Core 默认值一致）；
+ * - `置信度` 固定 [DEFAULT_CONFIDENCE]（服务端 OCR 默认阈值，与模板匹配的置信度设置互不影响）；
+ * - 401 重注册并重放一次；使用 [ApiClient.ocrHttp]（服务端单次识别上限 120s）。
+ */
+class OcrClient(
+    private val tokenManager: TokenManager,
+    private val baseUrlProvider: () -> String,
+) {
+    private val jsonMedia = "application/json".toMediaType()
+
+    companion object {
+        /** Tesseract `--psm 11`：稀疏文字，适合界面截图 */
+        const val DEFAULT_PSM = 11
+
+        /** 服务端 OCR 默认相似度阈值（OCR_Core 默认 0.5） */
+        const val DEFAULT_CONFIDENCE = 0.5f
+    }
+
+    /**
+     * @param pngBase64 截图 PNG 的 Base64（无 `data:` 前缀），与 /See 的图片字段一致
+     * @param targetText 要查找的文字；服务端按它过滤结果（支持配置的易混字符映射）
+     * @param psm Tesseract 页面分割模式，默认 [DEFAULT_PSM]
+     * @return 命中文字 → `[left, top]`；未命中返回空 Map
+     */
+    suspend fun recognize(
+        pngBase64: String,
+        targetText: String,
+        psm: Int = DEFAULT_PSM,
+    ): Map<String, List<Int>> =
+        withContext(AppExecutors.dispatcher) {
+            require(pngBase64.isNotEmpty()) { "截图数据为空" }
+            require(targetText.isNotBlank()) { "OCR 识别文字为空" }
+            repeat(2) { attempt ->
+                val body = ApiClient.json.encodeToString(
+                    OcrRequest.serializer(),
+                    OcrRequest(
+                        imageBase64 = pngBase64,
+                        targetText = targetText,
+                        confidence = DEFAULT_CONFIDENCE,
+                        psm = psm,
+                        cookieKey = tokenManager.validToken(),
+                    ),
+                )
+                val request = Request.Builder()
+                    .url(baseUrlProvider().trimEnd('/') + "/OCRPhoto")
+                    .post(body.toRequestBody(jsonMedia))
+                    .build()
+                ApiClient.ocrHttp.newCall(request).execute().use { response ->
+                    val raw = response.body?.string().orEmpty()
+                    when (response.code) {
+                        200 -> {
+                            val parsed = runCatching {
+                                ApiClient.json.decodeFromString(OcrResponse.serializer(), raw)
+                            }.getOrElse {
+                                throw ApiException("OCR 响应解析失败: ${raw.take(200)}")
+                            }
+                            return@withContext parsed.result.orEmpty()
+                        }
+
+                        401 -> {
+                            tokenManager.invalidate()
+                            if (attempt == 1) throw ApiException("令牌重注册后仍 401（服务端可能已重启）")
+                        }
+
+                        else -> {
+                            val msg = runCatching {
+                                ApiClient.json.decodeFromString<ApiMessage>(raw).message
+                            }.getOrNull()
+                            throw ApiException(
+                                "OCR 失败 HTTP ${response.code}: " +
+                                    (msg ?: raw.take(200).ifBlank { "无响应体" })
+                            )
+                        }
+                    }
+                }
+            }
+            throw IllegalStateException("unreachable")
+        }
 }

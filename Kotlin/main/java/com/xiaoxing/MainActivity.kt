@@ -30,7 +30,8 @@ import kotlinx.coroutines.launch
 class MainActivity : ComponentActivity() {
 
     private lateinit var projectionLauncher: ActivityResultLauncher<Intent>
-    private var pendingWorkflowName: String = ""
+    /** 待执行的流程（按勾选顺序）；投屏授权通过后整批交给前台服务串行执行 */
+    private var pendingWorkflowNames: List<String> = emptyList()
 
     /**
      * 通知权限是启动链路第一关：POST_NOTIFICATIONS 被拒 → 前台服务通知不上栏
@@ -61,7 +62,7 @@ class MainActivity : ComponentActivity() {
         ) { result ->
             val data = result.data
             if (result.resultCode == Activity.RESULT_OK && data != null) {
-                AutomationForegroundService.start(this, data, pendingWorkflowName)
+                AutomationForegroundService.start(this, data, pendingWorkflowNames)
             } else {
                 AppRepository.showHint("投屏授权被拒绝，无法启动自动化", HintLevel.ERROR)
             }
@@ -105,8 +106,8 @@ class MainActivity : ComponentActivity() {
      * POST_NOTIFICATIONS 已授予 → 投屏授权弹窗 → 前台服务（通知上栏）→ 帧池。
      * 未授予则先申请，拒绝即终止 —— 没有通知栏确认就不该建帧池。
      */
-    private fun requestStart(workflowName: String) {
-        pendingWorkflowName = workflowName
+    private fun requestStart(workflowNames: List<String>) {
+        pendingWorkflowNames = workflowNames
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) ==
             PackageManager.PERMISSION_GRANTED
         ) {

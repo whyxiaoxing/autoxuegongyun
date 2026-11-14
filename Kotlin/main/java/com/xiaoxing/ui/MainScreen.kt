@@ -73,7 +73,7 @@ private val NAV_ITEMS = listOf(
  */
 @Composable
 fun MainScreen(
-    onRequestStart: (workflowName: String) -> Unit,
+    onRequestStart: (workflowNames: List<String>) -> Unit,
     onStop: () -> Unit,
     onConfirmProjection: () -> Unit,
     onCancelProjection: () -> Unit,
@@ -144,7 +144,7 @@ private fun MainTabs(
     tab: Int,
     onTabSelected: (Int) -> Unit,
     stateHolder: SaveableStateHolder,
-    onRequestStart: (String) -> Unit,
+    onRequestStart: (List<String>) -> Unit,
     onStop: () -> Unit,
     onAddWorkflow: () -> Unit,
     onEditWorkflow: (String) -> Unit,

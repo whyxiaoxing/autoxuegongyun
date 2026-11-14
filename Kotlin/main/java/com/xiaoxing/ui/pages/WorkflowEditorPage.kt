@@ -78,11 +78,14 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.xiaoxing.AppRepository
 import com.xiaoxing.HintLevel
 import com.xiaoxing.ui.components.IconPlate
+import com.xiaoxing.ui.components.NumField
 import com.xiaoxing.ui.components.SectionEyebrow
 import com.xiaoxing.workflow.LaunchStep
+import com.xiaoxing.workflow.MAX_FAILURE_RETRIES
 import com.xiaoxing.workflow.Step
 import com.xiaoxing.workflow.Workflow
 import com.xiaoxing.workflow.WorkflowCodec
+import com.xiaoxing.workflow.flattenSteps
 import kotlinx.coroutines.launch
 
 private const val PAGE_FLOW = 0
@@ -115,6 +118,8 @@ internal fun WorkflowEditorPage(
     // 运行参数不再有统一设置：只在「启动应用」步骤里编辑，这里保存草稿值
     var wfInterval by rememberSaveable { mutableStateOf("1000") }
     var wfRetries by rememberSaveable { mutableStateOf("3") }
+    // 流程控制：整条流程失败后的重复次数（0 = 失败即停止）
+    var wfFailureRetries by rememberSaveable { mutableStateOf("0") }
     var stepsJson by rememberSaveable { mutableStateOf("") }
     var dirty by rememberSaveable { mutableStateOf(false) }
     var saving by remember { mutableStateOf(false) }
@@ -158,6 +163,7 @@ internal fun WorkflowEditorPage(
             wfName = workflow.name
             wfInterval = workflow.intervalMs.toString()
             wfRetries = workflow.maxRetries.toString()
+            wfFailureRetries = workflow.failureRetries.toString()
             stepsJson = WorkflowCodec.encodeCompact(workflow)
             dirty = false
         }
@@ -175,6 +181,8 @@ internal fun WorkflowEditorPage(
             targetPackage = "",
             intervalMs = wfInterval.toLongOrNull() ?: 1000L,
             maxRetries = wfRetries.toIntOrNull() ?: 3,
+            failureRetries = (wfFailureRetries.toIntOrNull() ?: 0)
+                .coerceIn(0, MAX_FAILURE_RETRIES),
             steps = newSteps,
         )
         return if (pretty) WorkflowCodec.encode(workflow) else WorkflowCodec.encodeCompact(workflow)
@@ -239,7 +247,7 @@ internal fun WorkflowEditorPage(
 
             nameTaken -> repo.showHint("已有同名工作流，请换一个名称", HintLevel.WARNING)
             latestSteps.isEmpty() -> repo.showHint("至少添加一个步骤", HintLevel.WARNING)
-            latestSteps.filterIsInstance<LaunchStep>().any { it.packageName.isBlank() } -> {
+            latestSteps.flattenSteps().filterIsInstance<LaunchStep>().any { it.packageName.isBlank() } -> {
                 page = PAGE_LIBRARY
                 repo.showHint("「启动应用」步骤还没选择目标应用", HintLevel.WARNING)
             }
@@ -435,6 +443,11 @@ internal fun WorkflowEditorPage(
                 wfName = wfName,
                 onNameChange = {
                     wfName = it
+                    dirty = true
+                },
+                failureRetries = wfFailureRetries,
+                onFailureRetriesChange = {
+                    wfFailureRetries = it
                     dirty = true
                 },
                 steps = steps,
@@ -703,6 +716,8 @@ private fun FlowStepRow(
 private fun LibraryPage(
     wfName: String,
     onNameChange: (String) -> Unit,
+    failureRetries: String,
+    onFailureRetriesChange: (String) -> Unit,
     steps: List<Step>,
     onAdd: (StepType) -> Unit,
     onEditStep: (Int) -> Unit,
@@ -722,6 +737,23 @@ private fun LibraryPage(
             placeholder = { Text("例如：每日签到") },
             singleLine = true,
             modifier = Modifier.fillMaxWidth(),
+        )
+
+        Spacer(Modifier.height(4.dp))
+        SectionEyebrow("流程控制")
+        NumField(
+            label = "失败重复次数",
+            value = failureRetries,
+            onValueChange = onFailureRetriesChange,
+            modifier = Modifier.fillMaxWidth(),
+        )
+        Text(
+            "整条流程因步骤失败中止后，从头再执行的次数；0 表示失败即停止（最多 $MAX_FAILURE_RETRIES 次）。" +
+                "失败次数耗尽时会震动并响铃提醒。" +
+                "IF 分支内的非可选步骤失败同样按这里的次数整条重放（IF 设为可选则跳过剩余分支）。",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(horizontal = 4.dp),
         )
 
         Spacer(Modifier.height(4.dp))

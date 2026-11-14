@@ -4,10 +4,12 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
@@ -15,6 +17,7 @@ import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -25,6 +28,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Home
@@ -48,6 +52,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -74,12 +79,18 @@ import com.xiaoxing.ui.components.AppSelectorField
 import com.xiaoxing.ui.components.IconPlate
 import com.xiaoxing.ui.components.NumField
 import com.xiaoxing.ui.components.SignedNumField
+import com.xiaoxing.ui.components.SwipeRecorderDialog
 import com.xiaoxing.workflow.AiTextStep
 import com.xiaoxing.workflow.CLICK_OFFSET_LIMIT
 import com.xiaoxing.workflow.GlobalActionStep
+import com.xiaoxing.workflow.IF_CONDITION_MATCH
+import com.xiaoxing.workflow.IF_CONDITION_OCR
+import com.xiaoxing.workflow.IF_CONDITION_PHOTO
+import com.xiaoxing.workflow.IfStep
 import com.xiaoxing.workflow.InputTextStep
 import com.xiaoxing.workflow.LaunchStep
 import com.xiaoxing.workflow.MatchStep
+import com.xiaoxing.workflow.OcrStep
 import com.xiaoxing.workflow.PhotoMatchStep
 import com.xiaoxing.workflow.SaveScreenshotStep
 import com.xiaoxing.workflow.Step
@@ -104,6 +115,8 @@ internal enum class StepType(
     SCREENSHOT("保存凭证", "截图存入相册", Icons.Filled.CheckCircle),
     AI_TEXT("AI 文案", "拼接身份信息并写入", Icons.Filled.Person),
     PHOTO_MATCH("图片匹配", "本地图片模板匹配", Icons.Filled.Search),
+    OCR("文字识别", "识别屏幕文字并点击", Icons.Filled.Search),
+    IF("条件 IF", "条件成立则走对应分支", Icons.Filled.Check),
 }
 
 internal fun Step.toStepType(): StepType = when (this) {
@@ -117,6 +130,8 @@ internal fun Step.toStepType(): StepType = when (this) {
     is SaveScreenshotStep -> StepType.SCREENSHOT
     is AiTextStep -> StepType.AI_TEXT
     is PhotoMatchStep -> StepType.PHOTO_MATCH
+    is OcrStep -> StepType.OCR
+    is IfStep -> StepType.IF
 }
 
 internal fun Step.summary(): String = when (this) {
@@ -145,7 +160,25 @@ internal fun Step.summary(): String = when (this) {
     is PhotoMatchStep -> buildString {
         append(template.ifBlank { "未选择模板" })
         if (tap) append(" · 命中点击")
+        if (offsetX != 0 || offsetY != 0) append(" · 偏移 (${offsetX}, ${offsetY})")
         append(" · 超时 ${timeoutMs}ms")
+        if (optional) append(" · 可选")
+    }
+    is OcrStep -> buildString {
+        append("「${keyword.ifBlank { "未填写文字" }}」")
+        if (tap) append(" · 命中点击")
+        if (offsetX != 0 || offsetY != 0) append(" · 偏移 (${offsetX}, ${offsetY})")
+        append(" · 超时 ${timeoutMs}ms")
+        if (optional) append(" · 可选")
+    }
+    is IfStep -> buildString {
+        when (condition) {
+            IF_CONDITION_PHOTO -> append("图片条件「${template.ifBlank { "未选择模板" }}」")
+            IF_CONDITION_OCR -> append("文字条件「${keyword.ifBlank { "未填写文字" }}」")
+            else -> append("模板条件「${template.ifBlank { "未选择模板" }}」")
+        }
+        append(" · 成立 ${thenSteps.size} 步")
+        if (elseSteps.isNotEmpty()) append(" / 否则 ${elseSteps.size} 步")
         if (optional) append(" · 可选")
     }
 }
@@ -162,6 +195,8 @@ internal fun StepType.defaultStep(matchTemplate: String = ""): Step = when (this
     StepType.SCREENSHOT -> SaveScreenshotStep(tag = "凭证")
     StepType.AI_TEXT -> AiTextStep(sections = IdentitySections.all.map { it.key })
     StepType.PHOTO_MATCH -> PhotoMatchStep(template = "")
+    StepType.OCR -> OcrStep(keyword = "")
+    StepType.IF -> IfStep(condition = IF_CONDITION_MATCH, template = matchTemplate)
 }
 
 /**
@@ -180,6 +215,7 @@ internal data class RunParameters(
  *
  * @param runInterval 当前工作流轮询间隔（仅「启动应用」展示，随步骤一起保存）
  * @param runRetries 当前工作流动作重试次数（仅「启动应用」展示，随步骤一起保存）
+ * @param showRunParameters 顶层「启动应用」才编辑运行参数；IF 块内步骤只读
  * @param onDelete 传入时显示删除入口（流程页/功能库页的步骤都通过这里移除）
  */
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
@@ -188,6 +224,7 @@ internal fun StepEditorSheet(
     base: Step,
     runInterval: String,
     runRetries: String,
+    showRunParameters: Boolean = true,
     onDismiss: () -> Unit,
     onConfirm: (Step, RunParameters?) -> Unit,
     onDelete: (() -> Unit)? = null,
@@ -233,6 +270,50 @@ internal fun StepEditorSheet(
     var photoTimeout by remember(base) {
         mutableStateOf((base as? PhotoMatchStep)?.timeoutMs?.toString() ?: "10000")
     }
+    var photoOffsetX by remember(base) {
+        mutableStateOf((base as? PhotoMatchStep)?.offsetX?.toString() ?: "0")
+    }
+    var photoOffsetY by remember(base) {
+        mutableStateOf((base as? PhotoMatchStep)?.offsetY?.toString() ?: "0")
+    }
+    var ocrKeyword by remember(base) { mutableStateOf((base as? OcrStep)?.keyword ?: "") }
+    var ocrTap by remember(base) { mutableStateOf((base as? OcrStep)?.tap ?: true) }
+    var ocrTimeout by remember(base) {
+        mutableStateOf((base as? OcrStep)?.timeoutMs?.toString() ?: "10000")
+    }
+    var ocrOffsetX by remember(base) { mutableStateOf((base as? OcrStep)?.offsetX?.toString() ?: "0") }
+    var ocrOffsetY by remember(base) { mutableStateOf((base as? OcrStep)?.offsetY?.toString() ?: "0") }
+    var ifCondition by remember(base) {
+        mutableStateOf((base as? IfStep)?.condition ?: IF_CONDITION_MATCH)
+    }
+    var ifTemplate by remember(base) {
+        val existing = base as? IfStep
+        mutableStateOf(
+            if (existing != null && existing.condition == IF_CONDITION_MATCH) existing.template else "",
+        )
+    }
+    var ifPhotoTemplate by remember(base) {
+        val existing = base as? IfStep
+        mutableStateOf(
+            if (existing != null && existing.condition == IF_CONDITION_PHOTO) existing.template else "",
+        )
+    }
+    var ifKeyword by remember(base) {
+        val existing = base as? IfStep
+        mutableStateOf(
+            if (existing != null && existing.condition == IF_CONDITION_OCR) existing.keyword else "",
+        )
+    }
+    var ifTimeout by remember(base) {
+        mutableStateOf((base as? IfStep)?.timeoutMs?.toString() ?: "10000")
+    }
+    var thenSteps by remember(base) { mutableStateOf((base as? IfStep)?.thenSteps ?: emptyList()) }
+    var elseSteps by remember(base) { mutableStateOf((base as? IfStep)?.elseSteps ?: emptyList()) }
+    // 块内步骤：点按编辑 / 添加时先选类型，再打开同一个编辑器（递归）
+    var childEdit by remember(base) { mutableStateOf<ChildStepEdit?>(null) }
+    var addToBranch by remember(base) { mutableStateOf<StepBranch?>(null) }
+    var showIfTemplatePicker by remember(base) { mutableStateOf(false) }
+    var showIfPhotoTemplatePicker by remember(base) { mutableStateOf(false) }
     var optional by remember(base) { mutableStateOf(base.optional) }
     // 运行参数只在「启动应用」功能里设置（工作流不再统一设置）
     var intervalDraft by remember(base) { mutableStateOf(runInterval) }
@@ -240,24 +321,33 @@ internal fun StepEditorSheet(
     // 底部弹窗是独立窗口，顶层提示会被盖住；表单错误同时在这里就地显示
     var validationError by remember(base) { mutableStateOf<String?>(null) }
     var showDeleteConfirm by remember(base) { mutableStateOf(false) }
+    var showSwipeRecorder by remember(base) { mutableStateOf(false) }
 
-    // 识别模板来自服务端：打开「模板匹配」表单时按需拉取一次
-    LaunchedEffect(type) {
-        if (type == StepType.MATCH) AppRepository.ensureTemplateNamesLoaded()
+    fun branchSteps(branch: StepBranch): List<Step> = when (branch) {
+        StepBranch.THEN -> thenSteps
+        StepBranch.ELSE -> elseSteps
     }
 
-    ModalBottomSheet(
-        onDismissRequest = onDismiss,
-        containerColor = MaterialTheme.colorScheme.surfaceContainerLow,
-    ) {
-        Column(
-            modifier = Modifier
-                .navigationBarsPadding()
-                .imePadding()
-                .verticalScroll(rememberScrollState())
-                .padding(horizontal = 20.dp, vertical = 4.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
-        ) {
+    fun setBranchSteps(branch: StepBranch, steps: List<Step>) {
+        when (branch) {
+            StepBranch.THEN -> thenSteps = steps
+            StepBranch.ELSE -> elseSteps = steps
+        }
+    }
+
+    // 识别模板来自服务端：打开「模板匹配」/「条件 IF（模板匹配）」表单时按需拉取一次
+    LaunchedEffect(type, ifCondition) {
+        if (type == StepType.MATCH || (type == StepType.IF && ifCondition == IF_CONDITION_MATCH)) {
+            AppRepository.ensureTemplateNamesLoaded()
+        }
+    }
+
+    // 普通步骤保持半屏 BottomSheet 手感；IF 分支列表会随增删步骤频繁变高，
+    // 且「轻拉下滑取消」与「继续编辑」的手势判定容易互相干扰，所以 IF 单独用全屏界面。
+    val sheetState = rememberModalBottomSheetState()
+
+    // 表单主体：BottomSheet（普通步骤）与全屏界面（IF）共用同一份状态、字段与校验逻辑。
+    val body: @Composable ColumnScope.() -> Unit = {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 IconPlate(type.icon, size = 42)
                 Spacer(Modifier.width(12.dp))
@@ -278,6 +368,12 @@ internal fun StepEditorSheet(
                         )
                     }
                 }
+                if (type == StepType.IF) {
+                    // 全屏界面没有下拉手势，给一个明确的关闭入口（等同底部「取消」）
+                    IconButton(onClick = onDismiss) {
+                        Icon(Icons.Filled.Close, contentDescription = "关闭编辑")
+                    }
+                }
             }
 
             when (type) {
@@ -296,23 +392,31 @@ internal fun StepEditorSheet(
                             color = MaterialTheme.colorScheme.error,
                         )
                     }
-                    NumField(
-                        "匹配轮询间隔（毫秒）",
-                        intervalDraft,
-                        { intervalDraft = it },
-                        Modifier.fillMaxWidth(),
-                    )
-                    NumField(
-                        "动作重试次数",
-                        retriesDraft,
-                        { retriesDraft = it },
-                        Modifier.fillMaxWidth(),
-                    )
-                    Text(
-                        "运行参数作用于整条工作流：间隔用于匹配轮询与步骤间停顿，重试用于点击、滑动等动作失败后的重放。",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
+                    if (showRunParameters) {
+                        NumField(
+                            "匹配轮询间隔（毫秒）",
+                            intervalDraft,
+                            { intervalDraft = it },
+                            Modifier.fillMaxWidth(),
+                        )
+                        NumField(
+                            "动作重试次数",
+                            retriesDraft,
+                            { retriesDraft = it },
+                            Modifier.fillMaxWidth(),
+                        )
+                        Text(
+                            "运行参数作用于整条工作流：间隔用于匹配轮询与步骤间停顿，重试用于点击、滑动等动作失败后的重放。",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    } else {
+                        Text(
+                            "运行参数只能在流程最外层的「启动应用」步骤里设置。",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
                 }
 
                 StepType.WAIT -> NumField("等待时长（毫秒）", ms, { ms = it }, Modifier.fillMaxWidth())
@@ -382,6 +486,21 @@ internal fun StepEditorSheet(
                 }
 
                 StepType.SWIPE -> {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            "滑动轨迹",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.weight(1f),
+                        )
+                        TextButton(onClick = { showSwipeRecorder = true }) { Text("录制滑动") }
+                    }
+                    Text(
+                        "点「录制滑动」后在屏幕上滑一次，自动填入起点、终点和实际时长；" +
+                            "坐标就是执行时使用的屏幕像素，无需再试凑。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
                     Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                         NumField("起点 X", x1, { x1 = it }, Modifier.weight(1f))
                         NumField("起点 Y", y1, { y1 = it }, Modifier.weight(1f))
@@ -532,8 +651,196 @@ internal fun StepEditorSheet(
                         { photoTimeout = it },
                         Modifier.fillMaxWidth(),
                     )
+                    Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        SignedNumField(
+                            "点击偏移 X（±$CLICK_OFFSET_LIMIT）",
+                            photoOffsetX,
+                            { photoOffsetX = it },
+                            Modifier.weight(1f),
+                        )
+                        SignedNumField(
+                            "点击偏移 Y（±$CLICK_OFFSET_LIMIT）",
+                            photoOffsetY,
+                            { photoOffsetY = it },
+                            Modifier.weight(1f),
+                        )
+                    }
+                    Text(
+                        "在模板命中点上叠加的像素偏移（可为负），用来微调实际点击位置；仅开启「命中后自动点击」时生效。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
                     Text(
                         "模板图片与当前截图一起提交给 /See_Submit_Photo，服务端不查 Photo/ 目录。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+
+                StepType.OCR -> {
+                    OutlinedTextField(
+                        value = ocrKeyword,
+                        onValueChange = { ocrKeyword = it },
+                        label = { Text("要识别的文字") },
+                        placeholder = { Text("例如：同意") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) {
+                            Text("命中后自动点击", style = MaterialTheme.typography.bodyMedium)
+                            Text(
+                                "点击识别结果中该文字的位置",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        Switch(checked = ocrTap, onCheckedChange = { ocrTap = it })
+                    }
+                    NumField(
+                        "识别超时（毫秒）",
+                        ocrTimeout,
+                        { ocrTimeout = it },
+                        Modifier.fillMaxWidth(),
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        SignedNumField(
+                            "点击偏移 X（±$CLICK_OFFSET_LIMIT）",
+                            ocrOffsetX,
+                            { ocrOffsetX = it },
+                            Modifier.weight(1f),
+                        )
+                        SignedNumField(
+                            "点击偏移 Y（±$CLICK_OFFSET_LIMIT）",
+                            ocrOffsetY,
+                            { ocrOffsetY = it },
+                            Modifier.weight(1f),
+                        )
+                    }
+                    Text(
+                        "截屏后调用 /OCRPhoto（Tesseract）：目标文字随请求提交，由服务端过滤" +
+                            "（支持易混字符映射），命中后点击文字中心；超时未识别视为失败。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Text(
+                        "在文字中心坐标上叠加的像素偏移（可为负），用来微调实际点击位置；" +
+                            "仅开启「命中后自动点击」时生效。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+
+                StepType.IF -> {
+                    Text(
+                        "条件类型",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    FlowRow(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        FilterChip(
+                            selected = ifCondition == IF_CONDITION_MATCH,
+                            onClick = { ifCondition = IF_CONDITION_MATCH },
+                            label = { Text("模板匹配") },
+                        )
+                        FilterChip(
+                            selected = ifCondition == IF_CONDITION_PHOTO,
+                            onClick = { ifCondition = IF_CONDITION_PHOTO },
+                            label = { Text("图片匹配") },
+                        )
+                        FilterChip(
+                            selected = ifCondition == IF_CONDITION_OCR,
+                            onClick = { ifCondition = IF_CONDITION_OCR },
+                            label = { Text("文字识别") },
+                        )
+                    }
+                    if (ifCondition == IF_CONDITION_OCR) {
+                        OutlinedTextField(
+                            value = ifKeyword,
+                            onValueChange = { ifKeyword = it },
+                            label = { Text("条件文字") },
+                            placeholder = { Text("例如：已登录") },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    } else if (ifCondition == IF_CONDITION_PHOTO) {
+                        TemplateSelectorField(
+                            label = "条件图片模板（本地）",
+                            value = ifPhotoTemplate,
+                            hint = if (localTemplates.isEmpty()) {
+                                "尚未导入本地模板"
+                            } else {
+                                "本机模板 · 共 ${localTemplates.size} 个"
+                            },
+                            enabled = localTemplates.isNotEmpty(),
+                            onClick = { showIfPhotoTemplatePicker = true },
+                        )
+                        if (localTemplates.isEmpty()) {
+                            Text(
+                                "还没有本地模板：请到 设置 → 本地模板 导入图片后回来选择。",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.error,
+                            )
+                        }
+                    } else {
+                        TemplateSelectorField(
+                            label = "条件模板（服务端）",
+                            value = ifTemplate,
+                            hint = when {
+                                templateNamesLoading -> "正在从服务端获取模板…"
+                                templateNamesError.isNotBlank() -> "获取失败：$templateNamesError"
+                                templateNames.isEmpty() -> "尚未获取到模板，打开后点右上角刷新"
+                                else -> "服务端模板库 · 共 ${templateNames.size} 个"
+                            },
+                            onClick = {
+                                showIfTemplatePicker = true
+                                AppRepository.ensureTemplateNamesLoaded()
+                            },
+                        )
+                        if (
+                            ifTemplate.isNotBlank() &&
+                            templateNames.isNotEmpty() &&
+                            ifTemplate !in templateNames
+                        ) {
+                            Text(
+                                "「$ifTemplate」已不在服务端模板列表中，请重新选择。",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.error,
+                            )
+                        }
+                    }
+                    NumField(
+                        "条件超时（毫秒）",
+                        ifTimeout,
+                        { ifTimeout = it },
+                        Modifier.fillMaxWidth(),
+                    )
+                    Text(
+                        "截屏执行模板匹配 / 图片匹配 / 文字识别（只判断是否成功，不点击）：" +
+                            "成功执行「成立分支」，超时未成功执行「否则分支」。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    BranchEditor(
+                        title = "成立分支",
+                        steps = thenSteps,
+                        onAdd = { addToBranch = StepBranch.THEN },
+                        onEdit = { childEdit = ChildStepEdit(StepBranch.THEN, it) },
+                        onDelete = { thenSteps = thenSteps.toMutableList().apply { removeAt(it) } },
+                    )
+                    BranchEditor(
+                        title = "否则分支",
+                        steps = elseSteps,
+                        onAdd = { addToBranch = StepBranch.ELSE },
+                        onEdit = { childEdit = ChildStepEdit(StepBranch.ELSE, it) },
+                        onDelete = { elseSteps = elseSteps.toMutableList().apply { removeAt(it) } },
+                    )
+                    Text(
+                        "块内步骤失败时：可选块跳过剩余步骤并继续；非可选块按普通步骤失败处理，" +
+                            "由工作流的「失败重复次数」决定是否整条重放。",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -582,6 +889,7 @@ internal fun StepEditorSheet(
                                 val retriesValue = retriesDraft.toIntOrNull()
                                 when {
                                     pkg.isBlank() -> "请选择要启动的目标应用"
+                                    !showRunParameters -> null
                                     intervalValue == null || intervalValue <= 0 ->
                                         "轮询间隔需为大于 0 的整数"
                                     retriesValue == null || retriesValue < 0 ->
@@ -606,10 +914,30 @@ internal fun StepEditorSheet(
                                 if (aiSections.isEmpty() && aiInstruction.isBlank()) {
                                     "AI 文案至少选择一段身份信息或填写补充要求"
                                 } else null
-                            StepType.PHOTO_MATCH ->
-                                if (photoTemplate.isBlank()) "请先选择本地图片模板"
-                                else if (photoTimeout.toLongOrNull() == null) "匹配超时需为数字"
-                                else null
+                            StepType.PHOTO_MATCH -> when {
+                                photoTemplate.isBlank() -> "请先选择本地图片模板"
+                                photoTimeout.toLongOrNull() == null -> "匹配超时需为数字"
+                                !isValidOffset(photoOffsetX) || !isValidOffset(photoOffsetY) ->
+                                    "点击偏移需为 -$CLICK_OFFSET_LIMIT ~ $CLICK_OFFSET_LIMIT 的整数"
+                                else -> null
+                            }
+                            StepType.OCR -> when {
+                                ocrKeyword.isBlank() -> "请填写要识别的文字"
+                                ocrTimeout.toLongOrNull() == null -> "识别超时需为数字"
+                                !isValidOffset(ocrOffsetX) || !isValidOffset(ocrOffsetY) ->
+                                    "点击偏移需为 -$CLICK_OFFSET_LIMIT ~ $CLICK_OFFSET_LIMIT 的整数"
+                                else -> null
+                            }
+                            StepType.IF -> when {
+                                ifCondition == IF_CONDITION_PHOTO && ifPhotoTemplate.isBlank() ->
+                                    "请先选择条件图片模板"
+                                ifCondition == IF_CONDITION_MATCH && ifTemplate.isBlank() ->
+                                    "请先选择条件模板"
+                                ifCondition == IF_CONDITION_OCR && ifKeyword.isBlank() ->
+                                    "请填写要识别的条件文字"
+                                ifTimeout.toLongOrNull() == null -> "条件超时需为数字"
+                                else -> null
+                            }
                             else -> null
                         }
                         if (error != null) {
@@ -654,10 +982,37 @@ internal fun StepEditorSheet(
                                         template = photoTemplate,
                                         tap = photoTap,
                                         timeoutMs = photoTimeout.toLong(),
+                                        offsetX = offsetValue(photoOffsetX),
+                                        offsetY = offsetValue(photoOffsetY),
+                                        optional = optional,
+                                    )
+                                    StepType.OCR -> OcrStep(
+                                        keyword = ocrKeyword.trim(),
+                                        tap = ocrTap,
+                                        timeoutMs = ocrTimeout.toLong(),
+                                        offsetX = offsetValue(ocrOffsetX),
+                                        offsetY = offsetValue(ocrOffsetY),
+                                        optional = optional,
+                                    )
+                                    StepType.IF -> IfStep(
+                                        condition = ifCondition,
+                                        template = when (ifCondition) {
+                                            IF_CONDITION_PHOTO -> ifPhotoTemplate
+                                            IF_CONDITION_OCR -> ""
+                                            else -> ifTemplate
+                                        },
+                                        keyword = if (ifCondition == IF_CONDITION_OCR) {
+                                            ifKeyword.trim()
+                                        } else {
+                                            ""
+                                        },
+                                        timeoutMs = ifTimeout.toLong(),
+                                        thenSteps = thenSteps,
+                                        elseSteps = elseSteps,
                                         optional = optional,
                                     )
                                 },
-                                if (type == StepType.LAUNCH) {
+                                if (type == StepType.LAUNCH && showRunParameters) {
                                     RunParameters(
                                         intervalMs = intervalDraft.toLong(),
                                         maxRetries = retriesDraft.toInt(),
@@ -671,6 +1026,58 @@ internal fun StepEditorSheet(
                     modifier = Modifier.weight(1f),
                 ) { Text("保存步骤") }
                 TextButton(onClick = onDismiss, modifier = Modifier.height(48.dp)) { Text("取消") }
+            }
+    }
+
+    if (type == StepType.IF) {
+        // IF 的独立全屏编辑界面：没有下拉手势，只有明确的关闭 / 取消 / 保存，
+        // 彻底避免「轻拉下滑 = 取消」与「正在编辑」之间的误判。
+        Dialog(
+            onDismissRequest = onDismiss,
+            properties = DialogProperties(
+                usePlatformDefaultWidth = false,
+                dismissOnClickOutside = false,
+                decorFitsSystemWindows = false,
+            ),
+        ) {
+            Surface(
+                modifier = Modifier.fillMaxSize(),
+                color = MaterialTheme.colorScheme.surfaceContainerLow,
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .statusBarsPadding()
+                        .navigationBarsPadding()
+                        .imePadding(),
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .weight(1f)
+                            .verticalScroll(rememberScrollState())
+                            .padding(horizontal = 20.dp, vertical = 12.dp),
+                        verticalArrangement = Arrangement.spacedBy(12.dp),
+                    ) {
+                        body()
+                    }
+                }
+            }
+        }
+    } else {
+        ModalBottomSheet(
+            onDismissRequest = onDismiss,
+            sheetState = sheetState,
+            containerColor = MaterialTheme.colorScheme.surfaceContainerLow,
+        ) {
+            Column(
+                modifier = Modifier
+                    .navigationBarsPadding()
+                    .imePadding()
+                    .verticalScroll(rememberScrollState())
+                    .padding(horizontal = 20.dp, vertical = 4.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                body()
             }
         }
     }
@@ -738,6 +1145,244 @@ internal fun StepEditorSheet(
             },
         )
     }
+
+    if (showIfTemplatePicker) {
+        TemplatePickerDialog(
+            title = "条件模板",
+            subtitle = "来自服务端 Photo 模板库",
+            current = ifTemplate,
+            options = templateNames,
+            loading = templateNamesLoading,
+            errorText = templateNamesError,
+            onRefresh = {
+                scope.launch { AppRepository.refreshTemplateNames() }
+            },
+            onDismiss = { showIfTemplatePicker = false },
+            onSelect = {
+                ifTemplate = it
+                showIfTemplatePicker = false
+            },
+        )
+    }
+
+    if (showIfPhotoTemplatePicker) {
+        TemplatePickerDialog(
+            title = "条件图片模板",
+            subtitle = "来自本机导入的模板图片",
+            current = ifPhotoTemplate,
+            options = localTemplates,
+            loading = false,
+            errorText = if (localTemplates.isEmpty()) "还没有本地模板，请到 设置 → 本地模板 导入图片。" else "",
+            onRefresh = null,
+            onDismiss = { showIfPhotoTemplatePicker = false },
+            onSelect = {
+                ifPhotoTemplate = it
+                showIfPhotoTemplatePicker = false
+            },
+        )
+    }
+
+    if (showSwipeRecorder) {
+        SwipeRecorderDialog(
+            onDismiss = { showSwipeRecorder = false },
+            onRecorded = { startX, startY, endX, endY, duration ->
+                x1 = startX.toString()
+                y1 = startY.toString()
+                x2 = endX.toString()
+                y2 = endY.toString()
+                swipeMs = duration.toString()
+                showSwipeRecorder = false
+            },
+        )
+    }
+
+    addToBranch?.let { branch ->
+        StepTypePickerDialog(
+            onDismiss = { addToBranch = null },
+            onPick = { type ->
+                val updated = branchSteps(branch) + type.defaultStep(
+                    matchTemplate = templateNames.firstOrNull().orEmpty(),
+                )
+                setBranchSteps(branch, updated)
+                addToBranch = null
+                childEdit = ChildStepEdit(branch, updated.lastIndex)
+            },
+        )
+    }
+
+    childEdit?.let { edit ->
+        val branchList = branchSteps(edit.branch)
+        val child = branchList.getOrNull(edit.index)
+        if (child == null) {
+            childEdit = null
+        } else {
+            StepEditorSheet(
+                base = child,
+                runInterval = runInterval,
+                runRetries = runRetries,
+                showRunParameters = false,
+                onDismiss = { childEdit = null },
+                onConfirm = { updated, _ ->
+                    setBranchSteps(
+                        edit.branch,
+                        branchList.toMutableList().apply { this[edit.index] = updated },
+                    )
+                    childEdit = null
+                },
+                onDelete = {
+                    setBranchSteps(
+                        edit.branch,
+                        branchList.toMutableList().apply { removeAt(edit.index) },
+                    )
+                    childEdit = null
+                },
+            )
+        }
+    }
+}
+
+/** IF 内的步骤归属：成立分支 / 否则分支 */
+private enum class StepBranch { THEN, ELSE }
+
+/** 正在编辑的块内步骤：分支 + 下标 */
+private data class ChildStepEdit(val branch: StepBranch, val index: Int)
+
+/** IF 块内步骤列表：点按编辑，右侧删除，「添加步骤」先选类型 */
+@Composable
+private fun BranchEditor(
+    title: String,
+    steps: List<Step>,
+    onAdd: () -> Unit,
+    onEdit: (Int) -> Unit,
+    onDelete: (Int) -> Unit,
+) {
+    val scheme = MaterialTheme.colorScheme
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(16.dp),
+        color = scheme.surfaceContainerHigh.copy(alpha = 0.45f),
+        border = BorderStroke(1.dp, scheme.outlineVariant.copy(alpha = 0.6f)),
+    ) {
+        Column(Modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(title, style = MaterialTheme.typography.labelLarge, modifier = Modifier.weight(1f))
+                Text(
+                    "${steps.size} 步",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = scheme.onSurfaceVariant,
+                )
+                TextButton(onClick = onAdd) { Text("添加步骤") }
+            }
+            if (steps.isEmpty()) {
+                Text(
+                    "空分支：点「添加步骤」加入要执行的步骤。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = scheme.onSurfaceVariant,
+                    modifier = Modifier.padding(horizontal = 4.dp, vertical = 6.dp),
+                )
+            } else {
+                steps.forEachIndexed { index, step ->
+                    val type = step.toStepType()
+                    Surface(
+                        onClick = { onEdit(index) },
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(12.dp),
+                        color = Color.Transparent,
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 4.dp, vertical = 7.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text(
+                                "${index + 1}",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = scheme.primary,
+                                modifier = Modifier.width(20.dp),
+                            )
+                            Icon(
+                                type.icon,
+                                contentDescription = null,
+                                tint = scheme.primary,
+                                modifier = Modifier.size(16.dp),
+                            )
+                            Spacer(Modifier.width(8.dp))
+                            Column(Modifier.weight(1f)) {
+                                Text(type.label, style = MaterialTheme.typography.labelMedium)
+                                Text(
+                                    step.summary(),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = scheme.onSurfaceVariant,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                            }
+                            IconButton(onClick = { onDelete(index) }) {
+                                Icon(
+                                    Icons.Filled.Delete,
+                                    contentDescription = "删除步骤",
+                                    tint = scheme.error,
+                                    modifier = Modifier.size(18.dp),
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/** 块内「添加步骤」的类型选择（含 IF，允许嵌套） */
+@Composable
+private fun StepTypePickerDialog(
+    onDismiss: () -> Unit,
+    onPick: (StepType) -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("添加步骤") },
+        text = {
+            Column(
+                modifier = Modifier
+                    .heightIn(max = 420.dp)
+                    .verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(2.dp),
+            ) {
+                StepType.entries.forEach { type ->
+                    Surface(
+                        onClick = { onPick(type) },
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(12.dp),
+                        color = Color.Transparent,
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(horizontal = 4.dp, vertical = 9.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Icon(
+                                type.icon,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.size(18.dp),
+                            )
+                            Spacer(Modifier.width(12.dp))
+                            Column {
+                                Text(type.label, style = MaterialTheme.typography.labelLarge)
+                                Text(
+                                    type.description,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) { Text("取消") }
+        },
+    )
 }
 
 /** 偏移输入合法性：空值 / 仅负号为 0；其余必须是 ±[CLICK_OFFSET_LIMIT] 内的整数 */

@@ -82,6 +82,8 @@ import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
@@ -90,6 +92,7 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.xiaoxing.AppRepository
+import com.xiaoxing.R
 import com.xiaoxing.HintLevel
 import com.xiaoxing.ServerConnectionState
 import com.xiaoxing.accessibility.AutomationAccessibilityService
@@ -127,6 +130,7 @@ internal fun SettingsDetailPage(
         SettingsDestination.PHOTO -> PhotoTemplateSettingsDetail(onBack)
         SettingsDestination.PERMISSIONS -> PermissionsSettingsDetail(onBack)
         SettingsDestination.AUTOMATION -> AutomationSettingsDetail(onBack)
+        SettingsDestination.ALERTS -> AlertSettingsDetail(onBack)
         SettingsDestination.APPEARANCE -> AppearanceSettingsDetail(onBack)
         SettingsDestination.ABOUT -> AboutSettingsDetail(onBack)
     }
@@ -134,7 +138,7 @@ internal fun SettingsDetailPage(
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun DetailScaffold(
+internal fun DetailScaffold(
     title: String,
     subtitle: String,
     onBack: () -> Unit,
@@ -715,7 +719,7 @@ private fun AutomationSettingsDetail(onBack: () -> Unit) {
 }
 
 @Composable
-private fun OptionSwitchRow(
+internal fun OptionSwitchRow(
     title: String,
     description: String,
     checked: Boolean,
@@ -1322,10 +1326,20 @@ private fun AppearanceSettingsDetail(onBack: () -> Unit) {
 @Composable
 private fun AboutSettingsDetail(onBack: () -> Unit) {
     val context = LocalContext.current
+    // 版本号取自系统包管理器（build.gradle 的 versionName），不写死
     val version = remember {
         runCatching {
             context.packageManager.getPackageInfo(context.packageName, 0).versionName
-        }.getOrNull() ?: "1.0"
+        }.getOrNull() ?: "0.0.2"
+    }
+
+    // 交给系统打开：用户设置的默认浏览器/应用决定最终打开方式
+    fun openLink(url: String) {
+        runCatching {
+            context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+        }.onFailure {
+            AppRepository.showHint("无法打开链接: ${it.message}", HintLevel.ERROR)
+        }
     }
 
     DetailScaffold(
@@ -1347,12 +1361,19 @@ private fun AboutSettingsDetail(onBack: () -> Unit) {
                         .padding(horizontal = 20.dp, vertical = 24.dp),
                     horizontalAlignment = Alignment.CenterHorizontally,
                 ) {
-                    IconPlate(Icons.Filled.Build, size = 58)
+                    Image(
+                        painter = painterResource(R.drawable.app_icon),
+                        contentDescription = "应用图标",
+                        modifier = Modifier
+                            .size(72.dp)
+                            .clip(CircleShape),
+                        contentScale = ContentScale.Crop,
+                    )
                     Spacer(Modifier.height(12.dp))
                     Text("工学云自动化", style = MaterialTheme.typography.titleLarge)
                     Spacer(Modifier.height(4.dp))
                     Text(
-                        "模板匹配驱动的 Android 自动化控制台",
+                        "基于云端服务的自动化AI识别客户端",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -1363,11 +1384,22 @@ private fun AboutSettingsDetail(onBack: () -> Unit) {
 
             AppPanelColumn {
                 Text("应用信息", style = MaterialTheme.typography.titleSmall)
-                InfoLine("包名", context.packageName)
+                InfoLine("开发者", "WhyXiaoXing")
                 AppDivider()
-                InfoLine("运行环境", "Android ${android.os.Build.VERSION.RELEASE}")
+                InfoLine("版本", version)
                 AppDivider()
-                InfoLine("自动化引擎", "MediaProjection + Accessibility + /See")
+                InfoLine("协议", "Apache 2.0")
+                AppDivider()
+                InfoLine(
+                    "项目地址",
+                    "github.com/whyxiaoxing/autoxuegongyun",
+                    onClick = { openLink("https://github.com/whyxiaoxing/autoxuegongyun") },
+                )
+                InfoLine(
+                    "项目地址",
+                    "gitee.com/whyxiaoxing/autoxuegongyun",
+                    onClick = { openLink("https://gitee.com/whyxiaoxing/autoxuegongyun") },
+                )
             }
             Spacer(Modifier.height(8.dp))
         }
@@ -1378,21 +1410,34 @@ private fun AboutSettingsDetail(onBack: () -> Unit) {
 // Shared bits
 // ---------------------------------------------------------------------------
 
+/**
+ * 信息行。传入 [onClick] 时按链接样式显示（主题色 + 下划线，整行可点），
+ * 点击行为由调用方决定（项目地址交给系统默认浏览器打开）。
+ */
 @Composable
-private fun InfoLine(label: String, value: String) {
+private fun InfoLine(
+    label: String,
+    value: String,
+    onClick: (() -> Unit)? = null,
+) {
+    val scheme = MaterialTheme.colorScheme
     Row(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier
+            .fillMaxWidth()
+            .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Text(
             label,
             style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            color = scheme.onSurfaceVariant,
             modifier = Modifier.width(88.dp),
         )
         Text(
             value,
             style = MaterialTheme.typography.bodySmall,
+            color = if (onClick != null) scheme.primary else Color.Unspecified,
+            textDecoration = if (onClick != null) TextDecoration.Underline else null,
             modifier = Modifier.weight(1f),
             maxLines = 2,
             overflow = TextOverflow.Ellipsis,

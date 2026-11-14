@@ -47,6 +47,20 @@ data class ServerConfig(
     }
 }
 
+/**
+ * 失败提醒配置（一级导航「提醒」页可调）。
+ *
+ * @property vibrationEnabled 流程失败时是否震动
+ * @property ringtoneEnabled 流程失败时是否响铃
+ * @property ringtoneUri 自定义铃声 URI；空 = 系统默认闹铃
+ */
+@Immutable
+data class FailureAlertSettings(
+    val vibrationEnabled: Boolean = true,
+    val ringtoneEnabled: Boolean = true,
+    val ringtoneUri: String = "",
+)
+
 /** 阿里云 OSS 资源源配置（公共读 Bucket，走虚拟主机式 URL，无需签名） */
 @Immutable
 data class OssConfig(
@@ -75,6 +89,9 @@ object SettingsStore {
     private val SAVE_SCREENSHOTS = booleanPreferencesKey("capture_save_screenshots")
     private val CLICK_EFFECT = booleanPreferencesKey("click_effect")
     private val SKIP_PROJECTION_CONFIRM = booleanPreferencesKey("skip_projection_confirm")
+    private val FAILURE_VIBRATION = booleanPreferencesKey("failure_vibration")
+    private val FAILURE_RINGTONE = booleanPreferencesKey("failure_ringtone")
+    private val FAILURE_RINGTONE_URI = stringPreferencesKey("failure_ringtone_uri")
     private val MATCH_CONFIDENCE_KEY = floatPreferencesKey("match_confidence")
     private val THEME_MODE = stringPreferencesKey("theme_mode")
     private val IDENTITY_UNIT = stringPreferencesKey("identity_unit")
@@ -130,6 +147,17 @@ object SettingsStore {
     /** 跳过投屏二次确认（第二层闸门）：开启后不再等待通知栏「继续共享」确认（默认关） */
     val skipProjectionConfirm: Flow<Boolean> by lazy {
         appContext.dataStore.data.map { it[SKIP_PROJECTION_CONFIRM] ?: false }
+    }
+
+    /** 失败提醒：震动开关、铃声开关与自定义铃声 URI（默认全开、系统默认闹铃） */
+    val failureAlertSettings: Flow<FailureAlertSettings> by lazy {
+        appContext.dataStore.data.map {
+            FailureAlertSettings(
+                vibrationEnabled = it[FAILURE_VIBRATION] ?: true,
+                ringtoneEnabled = it[FAILURE_RINGTONE] ?: true,
+                ringtoneUri = it[FAILURE_RINGTONE_URI].orEmpty(),
+            )
+        }
     }
 
     /** 识别置信度：传给 /See 与 /See_Submit_Photo 的 threshold（默认 0.7） */
@@ -189,6 +217,18 @@ object SettingsStore {
 
     suspend fun saveSkipProjectionConfirm(value: Boolean) {
         appContext.dataStore.edit { it[SKIP_PROJECTION_CONFIRM] = value }
+    }
+
+    suspend fun saveFailureVibration(value: Boolean) {
+        appContext.dataStore.edit { it[FAILURE_VIBRATION] = value }
+    }
+
+    suspend fun saveFailureRingtone(value: Boolean) {
+        appContext.dataStore.edit { it[FAILURE_RINGTONE] = value }
+    }
+
+    suspend fun saveFailureRingtoneUri(uri: String) {
+        appContext.dataStore.edit { it[FAILURE_RINGTONE_URI] = uri.trim() }
     }
 
     suspend fun saveMatchConfidence(value: Float) {

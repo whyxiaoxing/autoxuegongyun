@@ -1,0 +1,16 @@
+[build-system]
+requires = ["scikit-build-core>=0.10"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "ExpandGXYxiaoxing"
+version = "0.1.2"
+description = "XiaoXing自动化工学云Python扩展"
+requires-python = ">=3.12"
+
+[tool.scikit-build]
+minimum-version = "0.10"
+cmake.version = ">=3.18"
+cmake.build-type = "Release"
+cmake.args = ["-G", "Visual Studio 18 2026", "-A", "x64"]
+wheel.packages = ["ExpandGXYxiaoxing"]

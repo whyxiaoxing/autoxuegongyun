@@ -51,7 +51,11 @@ class AutomationForegroundService : Service() {
         private const val LEGACY_CHANNEL_ID = "automation_channel"
         const val NOTIFICATION_ID = 1
         const val EXTRA_PROJECTION = "com.xiaoxing.extra.PROJECTION_RESULT"
-        const val EXTRA_WORKFLOW = "com.xiaoxing.extra.WORKFLOW_NAME"
+        const val EXTRA_WORKFLOWS = "com.xiaoxing.extra.WORKFLOW_NAMES"
+
+        /** 失败通知独立通道：声音/震动由 [FailureAlert] 显式触发，这里保持静音避免双响 */
+        private const val FAILURE_CHANNEL_ID = "automation_failure_v1"
+        private const val FAILURE_NOTIFICATION_ID = 2
 
         /** 通知栏确认按钮的动作（PendingIntent.getService → onStartCommand） */
         const val ACTION_CONFIRM = "com.xiaoxing.action.PROJECTION_CONFIRM"
@@ -67,10 +71,11 @@ class AutomationForegroundService : Service() {
         var alive = false
             private set
 
-        fun start(context: Context, projectionData: Intent, workflowName: String) {
+        /** @param workflowNames 按执行顺序排列；多条流程共享同一次投屏授权与前台服务 */
+        fun start(context: Context, projectionData: Intent, workflowNames: List<String>) {
             val intent = Intent(context, AutomationForegroundService::class.java).apply {
                 putExtra(EXTRA_PROJECTION, projectionData)
-                putExtra(EXTRA_WORKFLOW, workflowName)
+                putStringArrayListExtra(EXTRA_WORKFLOWS, ArrayList(workflowNames))
             }
             ContextCompat.startForegroundService(context, intent)
         }
@@ -108,10 +113,15 @@ class AutomationForegroundService : Service() {
         val projectionData = intent?.let {
             IntentCompat.getParcelableExtra(it, EXTRA_PROJECTION, Intent::class.java)
         }
-        val workflowName = intent?.getStringExtra(EXTRA_WORKFLOW).orEmpty()
+        val workflowNames = intent?.getStringArrayListExtra(EXTRA_WORKFLOWS)
+            ?.map { it.trim() }
+            ?.filter { it.isNotBlank() }
+            .orEmpty()
 
         goForeground(withProjection = projectionData != null)
         acquireWakeLock()
+        // 新一次运行开始：清掉上一轮遗留的失败通知
+        getSystemService(NotificationManager::class.java).cancel(FAILURE_NOTIFICATION_ID)
 
         if (engineJob?.isActive == true) {
             AppRepository.showHint("已有工作流在运行，请先停止再启动新的任务", HintLevel.WARNING)
@@ -120,87 +130,40 @@ class AutomationForegroundService : Service() {
 
         if (projectionData == null) {
             // 系统重启服务（START_STICKY）场景：投影令牌已随进程丢失，无法自行恢复截屏
-            AppRepository.showHint(
-                "自动化服务被系统重启，但投屏授权已丢失 —— 请回到页面重新启动",
-                HintLevel.ERROR,
-            )
+            val message = "自动化服务被系统重启，投屏授权已丢失 —— 请回到页面重新启动"
+            AppRepository.showHint(message, HintLevel.ERROR)
             updateNotification("自动化中断：请回到页面重新启动（需重新授权投屏）")
+            FailureAlert.alert(applicationContext, AppRepository.failureAlertSettings.value)
+            postFailureNotification(message)
+            return START_STICKY
+        }
+
+        if (workflowNames.isEmpty()) {
+            AppRepository.showHint("没有选择要执行的工作流", HintLevel.WARNING)
+            updateNotification("自动化未启动：未选择工作流")
+            stopSelf()
             return START_STICKY
         }
 
         engineJob = scope.launch {
-            runCatching {
-                val workflow = WorkflowRepository.load(applicationContext, workflowName)
-                    ?: throw IllegalStateException("工作流不存在或解析失败: $workflowName")
-
-                // 官方时序（Android 14+）：用户授权 → mediaProjection FGS 通知真正上栏 → 才能建帧池。
-                // 通知未上栏（典型：拒绝 POST_NOTIFICATIONS）就 getMediaProjection/createVirtualDisplay，
-                // 投影不出帧，帧池永远为空 —— 所以此处先"通知栏确认"，失败则不创建帧池直接中止。
-                if (!awaitNotificationInBar()) {
-                    throw IllegalStateException(
-                        "前台服务通知未出现在通知栏（多半是拒绝了通知权限），帧池未创建 —— 请授予通知权限后重新启动"
-                    )
-                }
-
-                val manager = ScreenCaptureManager(applicationContext)
-                    .also { this@AutomationForegroundService.capture = it }
-                manager.onProjectionStopped = {
-                    AppRepository.showHint("投屏已被停止（用户或系统撤销），自动化已中止", HintLevel.WARNING)
-                    AppRepository.setProjectionGate(ProjectionGate.CANCELLED)
-                    stopSelf()
-                }
-                manager.start(projectionData)
-
-                // 第二层闸门：Android 只授权了「可以截屏」，部分厂商 ROM（MIUI/HyperOS 等）还会在
-                // 通知栏再加一道「继续共享」，未点之前投屏画面会被隐私保护模糊成圆角卡片。
-                // 该状态没有公共 API 可查，只能由页面弹窗让用户显式确认；页面同时显示实时预览，
-                // 用户可以自己看出闸门是否已放行。确认前不进入任何工作流步骤。
-                // 设置里开启「跳过投屏二次确认」后整道闸门都不再出现，授权完成即进入步骤。
-                val skipConfirm = AppRepository.skipProjectionConfirm.value
-                if (skipConfirm) {
-                    AppRepository.setProjectionGate(ProjectionGate.NONE)
-                    updateNotification("自动化运行中（已跳过投屏二次确认）")
-                } else {
-                    AppRepository.setProjectionGate(ProjectionGate.AWAITING)
-                    updateNotification(
-                        "等待确认：通知栏点「继续共享」，再点「已确认，开始」",
-                        awaitingConfirm = true,
-                    )
-                }
-                // 帧池预热（等待首帧）已移入 WorkflowEngine 初始化阶段，与二次确认并行
-
-                val engine = WorkflowEngine(
-                    context = applicationContext,
-                    capture = manager,
-                    see = AppRepository.seeClient,
-                    aiText = AppRepository.aiTextClient,
-                    identity = { AppRepository.identityInfo.value },
-                )
-                engine.onStatusChange = { AppRepository.engineStatus.value = it }
-                engine.onMinimizeRequest = { AppRepository.requestMinimize() }
-
-                AppRepository.setRunning(true)
-                // 初始化与二次确认在引擎里并行；确认通过后才进入步骤
-                val confirmGate: suspend (String) -> Boolean =
-                    if (skipConfirm) { _ -> true } else ::awaitUserConfirm
-                engine.run(workflow, AppRepository.targetPackage.value, confirmGate)
-            }.onSuccess {
-                AppRepository.showHint("工作流「$workflowName」已完成", HintLevel.SUCCESS)
-            }.onFailure { e ->
-                if (e is CancellationException) {
-                    // 用户主动停止：首页已有「已请求停止」提示，不再重复报错
-                } else if (
+            try {
+                runWorkflowBatch(projectionData, workflowNames)
+            } catch (e: CancellationException) {
+                // 用户主动停止：首页已有「已请求停止」提示，不再重复报错
+            } catch (e: Exception) {
+                if (
                     AppRepository.projectionGate.value == ProjectionGate.CANCELLED &&
                     !AppRepository.skipProjectionConfirm.value
                 ) {
                     // 仅在真正等待过闸门时才用「取消确认」文案；跳过闸门时投屏被撤销走通用中止提示
                     AppRepository.showHint("已取消投屏确认，工作流未启动", HintLevel.WARNING)
                 } else {
-                    AppRepository.showHint(
-                        e.message?.takeIf { it.isNotBlank() }?.let { "自动化中止: $it" }
-                            ?: "自动化中止：未知错误",
-                        HintLevel.ERROR,
-                    )
+                    val message = e.message?.takeIf { it.isNotBlank() }
+                        ?.let { "自动化中止: $it" }
+                        ?: "自动化中止：未知错误"
+                    AppRepository.showHint(message, HintLevel.ERROR)
+                    FailureAlert.alert(applicationContext, AppRepository.failureAlertSettings.value)
+                    postFailureNotification(message)
                 }
             }
             AppRepository.setRunning(false)
@@ -210,6 +173,120 @@ class AutomationForegroundService : Service() {
             stopSelf()
         }
         return START_STICKY
+    }
+
+    /**
+     * 按勾选顺序串行执行多条工作流，共享同一次投屏授权与前台服务。
+     *
+     * 失败语义：
+     *  - 单条流程失败（含引擎内的失败重复次数耗尽）不会中断后续流程，结束时汇总成功/失败数；
+     *  - 用户主动停止、取消投屏确认、投屏被撤销会中止整批；
+     *  - 每条流程最终失败时震动 + 响铃，并保留一条失败通知。
+     */
+    private suspend fun runWorkflowBatch(projectionData: Intent, workflowNames: List<String>) {
+        // 官方时序（Android 14+）：用户授权 → mediaProjection FGS 通知真正上栏 → 才能建帧池。
+        // 通知未上栏（典型：拒绝 POST_NOTIFICATIONS）就 getMediaProjection/createVirtualDisplay，
+        // 投影不出帧，帧池永远为空 —— 所以此处先"通知栏确认"，失败则不创建帧池直接中止。
+        if (!awaitNotificationInBar()) {
+            throw IllegalStateException(
+                "前台服务通知未出现在通知栏（多半是拒绝了通知权限），帧池未创建 —— 请授予通知权限后重新启动"
+            )
+        }
+
+        val manager = ScreenCaptureManager(applicationContext)
+            .also { this@AutomationForegroundService.capture = it }
+        manager.onProjectionStopped = {
+            AppRepository.showHint("投屏已被停止（用户或系统撤销），自动化已中止", HintLevel.WARNING)
+            AppRepository.setProjectionGate(ProjectionGate.CANCELLED)
+            stopSelf()
+        }
+        manager.start(projectionData)
+
+        // 第二层闸门：Android 只授权了「可以截屏」，部分厂商 ROM（MIUI/HyperOS 等）还会在
+        // 通知栏再加一道「继续共享」，未点之前投屏画面会被隐私保护模糊成圆角卡片。
+        // 该状态没有公共 API 可查，只能由页面弹窗让用户显式确认；页面同时显示实时预览，
+        // 用户可以自己看出闸门是否已放行。确认前不进入任何工作流步骤。
+        // 设置里开启「跳过投屏二次确认」后整道闸门都不再出现，授权完成即进入步骤。
+        val skipConfirm = AppRepository.skipProjectionConfirm.value
+        if (skipConfirm) {
+            AppRepository.setProjectionGate(ProjectionGate.NONE)
+            updateNotification("自动化运行中（已跳过投屏二次确认）")
+        } else {
+            AppRepository.setProjectionGate(ProjectionGate.AWAITING)
+            updateNotification(
+                "等待确认：通知栏点「继续共享」，再点「已确认，开始」",
+                awaitingConfirm = true,
+            )
+        }
+        // 帧池预热（等待首帧）已移入 WorkflowEngine 初始化阶段，与二次确认并行
+
+        val engine = WorkflowEngine(
+            context = applicationContext,
+            capture = manager,
+            see = AppRepository.seeClient,
+            aiText = AppRepository.aiTextClient,
+            ocr = AppRepository.ocrClient,
+            identity = { AppRepository.identityInfo.value },
+        )
+        engine.onMinimizeRequest = { AppRepository.requestMinimize() }
+
+        AppRepository.setRunning(true)
+        // 初始化与二次确认在引擎里并行；确认通过后才进入步骤。首次确认后闸门保持 CONFIRMED，
+        // 后续流程直接放行，不再重复拉起目标应用。
+        val confirmGate: suspend (String) -> Boolean =
+            if (skipConfirm) { _ -> true } else ::awaitUserConfirm
+
+        val total = workflowNames.size
+        var succeeded = 0
+        val failed = mutableListOf<String>()
+
+        workflowNames.forEachIndexed { index, name ->
+            val position = if (total > 1) "(${index + 1}/$total) " else ""
+            engine.onStatusChange = { status ->
+                AppRepository.engineStatus.value = position + status
+            }
+            updateNotification(
+                if (total > 1) "自动化运行中（${index + 1}/$total）：$name" else "自动化运行中：$name",
+            )
+
+            val workflow = WorkflowRepository.load(applicationContext, name)
+            if (workflow == null) {
+                failed += name
+                val reason = "流程「$name」无法读取：文件不存在或解析失败"
+                AppRepository.showHint(reason, HintLevel.ERROR)
+                FailureAlert.alert(applicationContext, AppRepository.failureAlertSettings.value)
+                return@forEachIndexed
+            }
+
+            try {
+                engine.run(workflow, AppRepository.targetPackage.value, confirmGate)
+                succeeded++
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                // 闸门取消 = 用户明确中止：停止整批，交给外层按「取消」提示
+                if (AppRepository.projectionGate.value == ProjectionGate.CANCELLED && !skipConfirm) {
+                    throw e
+                }
+                failed += name
+                val reason = "流程「$name」失败: " +
+                    (e.message?.takeIf { it.isNotBlank() } ?: "未知错误")
+                AppRepository.showHint(reason, HintLevel.ERROR)
+                // 失败重复次数已在引擎内部消化；这里只对最终失败提醒一次
+                FailureAlert.alert(applicationContext, AppRepository.failureAlertSettings.value)
+            }
+        }
+
+        if (failed.isEmpty()) {
+            val done = if (total > 1) "$total 条流程" else "工作流「${workflowNames.first()}」"
+            AppRepository.showHint("$done 已完成", HintLevel.SUCCESS)
+            updateNotification("自动化完成（成功 $succeeded 条）")
+        } else {
+            val summary = "自动化结束：成功 $succeeded 条，失败 ${failed.size} 条" +
+                "（${failed.joinToString()}）"
+            AppRepository.showHint(summary, HintLevel.ERROR)
+            postFailureNotification(summary)
+        }
     }
 
     override fun onTaskRemoved(rootIntent: Intent?) {
@@ -249,6 +326,13 @@ class AutomationForegroundService : Service() {
      * → 置 CONFIRMED → 进入步骤。期间初始化已在并行进行，确认后不再额外等待。
      */
     private suspend fun awaitUserConfirm(targetPackage: String): Boolean {
+        // 多流程串行：首次确认后闸门保持 CONFIRMED，后续流程直接放行，
+        // 不再重复拉起目标应用（每个流程的目标可能不同，也不该在确认后跳走）。
+        when (AppRepository.projectionGate.value) {
+            ProjectionGate.CONFIRMED -> return true
+            ProjectionGate.CANCELLED -> return false
+            else -> Unit
+        }
         launchTargetForGate(targetPackage)
         val deadline = System.currentTimeMillis() + CONFIRM_TIMEOUT_MS
         while (System.currentTimeMillis() < deadline) {
@@ -346,6 +430,31 @@ class AutomationForegroundService : Service() {
             .notify(NOTIFICATION_ID, buildNotification(text, awaitingConfirm))
     }
 
+    /**
+     * 失败通知：前台服务结束后仍保留在通知栏，方便用户事后查看是哪条流程失败。
+     * 通道本身静音（声音/震动由 [FailureAlert] 显式触发），避免一次失败响两遍。
+     */
+    private fun postFailureNotification(text: String) {
+        runCatching {
+            val contentIntent = PendingIntent.getActivity(
+                this, 2,
+                Intent(this, MainActivity::class.java),
+                PendingIntent.FLAG_IMMUTABLE,
+            )
+            val notification = NotificationCompat.Builder(this, FAILURE_CHANNEL_ID)
+                .setSmallIcon(android.R.drawable.stat_notify_error)
+                .setContentTitle("自动化失败")
+                .setContentText(text)
+                .setStyle(NotificationCompat.BigTextStyle().bigText(text))
+                .setPriority(NotificationCompat.PRIORITY_HIGH)
+                .setAutoCancel(true)
+                .setContentIntent(contentIntent)
+                .build()
+            getSystemService(NotificationManager::class.java)
+                .notify(FAILURE_NOTIFICATION_ID, notification)
+        }
+    }
+
     private fun acquireWakeLock() {
         if (wakeLock?.isHeld == true) return
         val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
@@ -366,5 +475,18 @@ class AutomationForegroundService : Service() {
             setShowBadge(false)
         }
         nm.createNotificationChannel(channel)
+
+        // 失败通道：高重要性保证弹窗可见；声音与震动交给 FailureAlert，这里静音避免双响
+        val failureChannel = NotificationChannel(
+            FAILURE_CHANNEL_ID,
+            "自动化失败提醒",
+            NotificationManager.IMPORTANCE_HIGH,
+        ).apply {
+            description = "工作流执行失败时的通知（同时震动并响铃）"
+            setSound(null, null)
+            enableVibration(false)
+            setShowBadge(true)
+        }
+        nm.createNotificationChannel(failureChannel)
     }
 }
