@@ -103,7 +103,7 @@ internal fun AlertSettingsDetail(onBack: () -> Unit) {
                     Column(Modifier.weight(1f)) {
                         Text("失败提醒", style = MaterialTheme.typography.titleSmall)
                         Text(
-                            "流程最终失败时提醒（含失败重复次数耗尽）。主动停止或取消投屏确认不会提醒。",
+                            "流程最终失败时提醒（含每个步骤的失败重试耗尽）。主动停止或取消投屏确认不会提醒。",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )

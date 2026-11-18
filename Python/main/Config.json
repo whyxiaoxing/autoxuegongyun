@@ -1,8 +1,8 @@
 {
   "IP": "127.0.0.1",
   "Port": 8004,
-  "AIURL": "http://127.0.0.1:8084/chat/completions",
-  "Model": "deepseek-flash",
+  "AIURL": "http://172.168.10.4:8006/v1/chat/completions",
+  "Model": "qwen3.5:9b",
   "Deepthink": "False",
   "APItype": "Ollama",
   "ApiKey": "",

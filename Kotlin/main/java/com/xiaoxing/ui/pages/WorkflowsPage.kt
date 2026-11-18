@@ -28,6 +28,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Brush
@@ -118,6 +119,15 @@ private fun WorkflowBanner(
     onClick: () -> Unit,
 ) {
     val scheme = MaterialTheme.colorScheme
+    // 渐变 Brush 只在主题色变化时重建；旧实现每次重组都会为每张卡片分配一个 Shader
+    val tileBrush = remember(scheme.primary, scheme.tertiary) {
+        Brush.linearGradient(
+            listOf(
+                scheme.primary.copy(alpha = 0.22f),
+                scheme.tertiary.copy(alpha = 0.14f),
+            ),
+        )
+    }
     Surface(
         onClick = onClick,
         modifier = Modifier.fillMaxWidth(),
@@ -134,15 +144,7 @@ private fun WorkflowBanner(
             Box(
                 modifier = Modifier
                     .size(52.dp)
-                    .background(
-                        Brush.linearGradient(
-                            listOf(
-                                scheme.primary.copy(alpha = 0.22f),
-                                scheme.tertiary.copy(alpha = 0.14f),
-                            ),
-                        ),
-                        RoundedCornerShape(17.dp),
-                    ),
+                    .background(tileBrush, RoundedCornerShape(17.dp)),
                 contentAlignment = Alignment.Center,
             ) {
                 Text(

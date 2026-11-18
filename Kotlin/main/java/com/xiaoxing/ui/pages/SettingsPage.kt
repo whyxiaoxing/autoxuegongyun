@@ -14,6 +14,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
+import androidx.compose.material.icons.automirrored.filled.List
 import androidx.compose.material.icons.filled.Build
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Lock
@@ -54,6 +55,7 @@ internal enum class SettingsDestination(val key: String, val title: String) {
     PERMISSIONS("permissions", "权限管理"),
     AUTOMATION("automation", "自动化选项"),
     ALERTS("alerts", "失败提醒"),
+    LOG("log", "运行日志"),
     APPEARANCE("appearance", "外观主题"),
     ABOUT("about", "关于"),
 }
@@ -159,6 +161,14 @@ internal fun SettingsPage(onOpen: (SettingsDestination) -> Unit) {
                             trailingColor = alertStatusColor,
                             onClick = { onOpen(SettingsDestination.ALERTS) },
                         )
+                        AppDivider(Modifier.padding(start = 68.dp))
+                        SettingsEntry(
+                            icon = Icons.AutoMirrored.Filled.List,
+                            title = "运行日志",
+                            subtitle = "本次运行的步骤、投屏与错误记录（仅内存）",
+                            accent = MaterialTheme.colorScheme.primary,
+                            onClick = { onOpen(SettingsDestination.LOG) },
+                        )
                     }
                 }
             }
@@ -172,7 +182,7 @@ internal fun SettingsPage(onOpen: (SettingsDestination) -> Unit) {
                         SettingsEntry(
                             icon = Icons.Filled.Person,
                             title = "身份信息",
-                            subtitle = "实习单位、身份描述、今日事件与报告，作为 /AiText 提示词",
+                            subtitle = "实习单位、身份描述、今日事件与报告，作为 /AiText 的 assistant 与提示词",
                             accent = MaterialTheme.colorScheme.tertiary,
                             trailingText = "已填 ${identity.filledCount}/6",
                             trailingColor = if (identity.filledCount == 0) {

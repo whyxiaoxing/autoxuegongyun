@@ -126,9 +126,14 @@ class AutomationAccessibilityService : AccessibilityService() {
         /** @param action "back" / "home" */
         fun globalAction(action: String): Boolean {
             val svc = live ?: return false
-            return when (action.lowercase()) {
-                "back" -> svc.performGlobalAction(AccessibilityService.GLOBAL_ACTION_BACK)
-                "home" -> svc.performGlobalAction(AccessibilityService.GLOBAL_ACTION_HOME)
+            // equals(ignoreCase) 避免每次动作都新建一个 lowercase 字符串
+            return when {
+                action.equals("back", ignoreCase = true) ->
+                    svc.performGlobalAction(AccessibilityService.GLOBAL_ACTION_BACK)
+
+                action.equals("home", ignoreCase = true) ->
+                    svc.performGlobalAction(AccessibilityService.GLOBAL_ACTION_HOME)
+
                 else -> false
             }
         }

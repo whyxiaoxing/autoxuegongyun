@@ -1,6 +1,8 @@
 package com.xiaoxing.network
 
 import com.xiaoxing.concurrent.AppExecutors
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
@@ -27,6 +29,19 @@ private data class SeeRequest(
 
 @Serializable
 private data class SeeResponse(@SerialName("result") val result: List<Int>? = null)
+
+/**
+ * /AiText 请求体：对应服务端 `AI文本` 模型，三个字段都必填，随 JSON body 发送。
+ *
+ * `提示词` 是 user 消息（今日事件/报告正文/补充要求），
+ * `assistant提示词` 是 assistant 消息的前缀预填（实习单位/身份描述 + 「这是一份周报」）。
+ */
+@Serializable
+private data class AiTextRequest(
+    @SerialName("提示词") val prompt: String,
+    @SerialName("assistant提示词") val assistantPrompt: String = "",
+    @SerialName("Cookie密钥") val cookieKey: String,
+)
 
 @Serializable
 private data class AiTextResponse(@SerialName("result") val result: String? = null)
@@ -64,13 +79,17 @@ private data class ApiMessage(@SerialName("message") val message: String? = null
 @Serializable
 private data class TemplateNamesResponse(@SerialName("result") val result: List<String>? = null)
 
-/** 匹配结果：NotFound 覆盖两种后端行为（旧版 200 result:null；rustmatch 版 500"没有找到目标位置"） */
+/**
+ * 匹配结果：NotFound 覆盖服务端的「未识别到目标」——
+ * HTTP 510 + `{"message": ...}`（main.py 的 except 分支），以及旧版 200 + result:null。
+ * 510 表示服务器可达、只是没匹配到；不能当成请求异常，否则匹配失败会被误判成网络错误。
+ */
 sealed interface MatchOutcome {
     data class Found(val x: Int, val y: Int) : MatchOutcome
 
     /**
      * 未匹配。
-     * [detail] 保留服务端返回的原始原因（如 "HTTP 500: 没有找到目标位置"），
+     * [detail] 保留服务端返回的原始原因（如 "HTTP 510: 没有找到目标位置"），
      * 只用于日志/页面展示，不参与控制流 —— 否则出问题时日志里只剩"超时未匹配"，无法定位。
      */
     data class NotFound(val detail: String? = null) : MatchOutcome
@@ -106,6 +125,14 @@ object ApiClient {
         .readTimeout(130, TimeUnit.SECONDS)
         .callTimeout(140, TimeUnit.SECONDS)
         .build()
+
+    /**
+     * 服务端契约：成功响应只带 `result`，失败响应只带 `message`。
+     * 错误文案优先取 `message`，解析不了时退回原文片段（如 FastAPI 的 422 `detail`）。
+     */
+    fun errorMessage(raw: String): String =
+        runCatching { json.decodeFromString<ApiMessage>(raw).message }.getOrNull()
+            ?: raw.take(200).ifBlank { "无响应体" }
 }
 
 /**
@@ -131,6 +158,9 @@ class TokenManager(private val baseUrlProvider: () -> String) {
     @Volatile
     private var issuedAtMs: Long = 0L
 
+    /** 令牌刷新串行化：初始化预检、AI 预取、匹配步骤可能同时发现令牌过期，只应注册一次。 */
+    private val refreshMutex = Mutex()
+
     val remainingMs: Long
         get() = if (token == null) 0 else (TOKEN_TTL_MS - (System.currentTimeMillis() - issuedAtMs)).coerceAtLeast(0)
 
@@ -141,14 +171,22 @@ class TokenManager(private val baseUrlProvider: () -> String) {
         issuedAtMs = 0L
     }
 
+    private fun isFresh(t: String?): Boolean =
+        t != null && System.currentTimeMillis() - issuedAtMs < TOKEN_TTL_MS - REFRESH_AHEAD_MS
+
     suspend fun validToken(): String {
-        val t = token
-        val age = System.currentTimeMillis() - issuedAtMs
-        return if (t != null && age < TOKEN_TTL_MS - REFRESH_AHEAD_MS) t else refresh()
+        token?.let { if (isFresh(it)) return it }
+        // 多个协程同时发现过期时，先拿到锁的注册，其余复用新令牌。
+        return refreshMutex.withLock {
+            token?.takeIf(::isFresh) ?: register()
+        }
     }
 
+    /** POST /Register：强制重新注册（连接测试需要真实请求，不做新鲜度复用）。 */
+    suspend fun refresh(): String = refreshMutex.withLock { register() }
+
     /** POST /Register，固定头 Headers: XIAOXING，从 Set-Cookie 解析 CookieAll */
-    suspend fun refresh(): String = withContext(AppExecutors.dispatcher) {
+    private suspend fun register(): String = withContext(AppExecutors.dispatcher) {
         val request = Request.Builder()
             .url(baseUrlProvider() + REGISTER_PATH)
             .header(AUTH_HEADER, AUTH_HEADER_VALUE)
@@ -156,10 +194,8 @@ class TokenManager(private val baseUrlProvider: () -> String) {
             .build()
         ApiClient.http.newCall(request).execute().use { response ->
             if (response.code != 200) {
-                val msg = runCatching {
-                    ApiClient.json.decodeFromString<ApiMessage>(response.body?.string() ?: "").message
-                }.getOrNull()
-                throw ApiException("注册失败 HTTP ${response.code}: ${msg ?: "无响应体"}")
+                val raw = response.body?.string().orEmpty()
+                throw ApiException("注册失败 HTTP ${response.code}: ${ApiClient.errorMessage(raw)}")
             }
             val setCookie = response.header("Set-Cookie")
                 ?: throw ApiException("注册响应缺少 Set-Cookie 头")
@@ -189,9 +225,12 @@ class SeeClient(
     }
 
     /**
-     * 单次匹配。401 → 重注册并重放一次；
-     * 500 且 message 含"没有找到目标位置" → NotFound（rustmatch 后端语义），
-     * 同时把服务端原文放进 [MatchOutcome.NotFound.detail]，避免诊断信息被静默丢弃。
+     * 单次匹配。
+     *  - 401 → 令牌失效，重注册并重放一次；
+     *  - 510 → NotFound（服务端语义：`510` 表示模板匹配失败/未识别到目标，服务器可达）。
+     *    不能把 510 当请求失败，否则匹配失败会被误判成网络/服务异常；
+     *    服务端的 `message` 放进 [MatchOutcome.NotFound.detail] 供排查；
+     *  - 其余状态码（含真实服务器错误 500）→ [ApiException]，并带上服务端 `message`。
      */
     suspend fun match(imageBase64: String, target: String): MatchOutcome {
         repeat(2) { attempt ->
@@ -226,17 +265,21 @@ class SeeClient(
                         if (attempt == 1) throw ApiException("令牌重注册后仍 401（服务端可能已重启）")
                     }
 
-                    500 -> {
+                    510 -> {
+                        // 服务端约定：模板匹配不到目标时 main.py 走 except 分支，
+                        // 返回 510 + {"message": 原因}。这是正常的「未匹配」，
+                        // 不能当请求失败处理，否则会被误判为网络/服务异常。
                         val msg = runCatching {
                             ApiClient.json.decodeFromString<ApiMessage>(raw).message
                         }.getOrNull()
-                        if (msg?.contains("没有找到目标位置") == true) {
-                            return MatchOutcome.NotFound("HTTP 500: $msg")
-                        }
-                        throw ApiException("服务端 500: ${msg ?: raw.take(200).ifBlank { "未知异常" }}")
+                        return MatchOutcome.NotFound(
+                            "HTTP 510: " + (msg ?: raw.take(200).ifBlank { "无响应体（服务端以 510 表示未匹配）" }),
+                        )
                     }
 
-                    else -> throw ApiException("HTTP ${response.code}: ${raw.take(200)}")
+                    else -> throw ApiException(
+                        "HTTP ${response.code}: " + ApiClient.errorMessage(raw),
+                    )
                 }
             }
         }
@@ -245,7 +288,7 @@ class SeeClient(
 
     /**
      * `POST /See_Submit_Photo`：模板图片 + 识别图片都由本机提供，服务端不查模板表。
-     * 401 重注册重放一次；500「没有找到目标位置」→ NotFound（与 /See 语义一致）。
+     * 401 重注册重放一次；510 → NotFound（与 /See 语义一致：510 = 未识别到目标，服务器可达）。
      */
     suspend fun matchPhoto(templatePngBase64: String, imagePngBase64: String): MatchOutcome {
         repeat(2) { attempt ->
@@ -284,17 +327,19 @@ class SeeClient(
                         if (attempt == 1) throw ApiException("令牌重注册后仍 401（服务端可能已重启）")
                     }
 
-                    500 -> {
+                    510 -> {
+                        // 与服务端 /See 一致：未识别到目标时返回 510 + message，属于正常未匹配
                         val msg = runCatching {
                             ApiClient.json.decodeFromString<ApiMessage>(raw).message
                         }.getOrNull()
-                        if (msg?.contains("没有找到目标位置") == true) {
-                            return MatchOutcome.NotFound("HTTP 500: $msg")
-                        }
-                        throw ApiException("提交图片服务端 500: ${msg ?: raw.take(200).ifBlank { "未知异常" }}")
+                        return MatchOutcome.NotFound(
+                            "HTTP 510: " + (msg ?: raw.take(200).ifBlank { "无响应体（服务端以 510 表示未匹配）" }),
+                        )
                     }
 
-                    else -> throw ApiException("提交图片 HTTP ${response.code}: ${raw.take(200)}")
+                    else -> throw ApiException(
+                        "提交图片 HTTP ${response.code}: " + ApiClient.errorMessage(raw),
+                    )
                 }
             }
         }
@@ -347,15 +392,9 @@ class TemplateNameClient(
                         if (attempt == 1) throw ApiException("令牌重注册后仍 401（服务端可能已重启）")
                     }
 
-                    else -> {
-                        val msg = runCatching {
-                            ApiClient.json.decodeFromString<ApiMessage>(raw).message
-                        }.getOrNull()
-                        throw ApiException(
-                            "获取模板列表失败 HTTP ${response.code}: " +
-                                (msg ?: raw.take(200).ifBlank { "无响应体" }),
-                        )
-                    }
+                    else -> throw ApiException(
+                        "获取模板列表失败 HTTP ${response.code}: " + ApiClient.errorMessage(raw),
+                    )
                 }
             }
         }
@@ -364,62 +403,63 @@ class TemplateNameClient(
 }
 
 /**
- * `POST /AiText?提示词=…&Cookie密钥=…`：服务端用系统提示词 + 大模型生成文案。
+ * `POST /AiText`：JSON 请求体（服务端 `AI文本` 模型）`{提示词, assistant提示词, Cookie密钥}`。
  *
- * 路由参数是 FastAPI 的非路径标量（默认 query），所以提示词必须放 URL query；
- * 请求体为空。生成耗时可能数分钟，使用 [ApiClient.longHttp]。
+ * 2026-11 服务端更新：该路由改为 Pydantic 请求体传参（不再是 query），服务端会用
+ * `data/SOUL.md` 作为系统提示词后转发大模型。生成耗时可能数分钟，使用 [ApiClient.longHttp]。
+ *
+ * @param assistantPrompt assistant 消息的前缀预填（身份信息 + 「这是一份周报」）；可为空串，
+ *   但字段必须存在 —— 服务端 Pydantic 模型把它列为必填。
  */
 class AiTextClient(
     private val tokenManager: TokenManager,
     private val baseUrlProvider: () -> String,
 ) {
-    suspend fun generate(prompt: String): String = withContext(AppExecutors.dispatcher) {
-        require(prompt.isNotBlank()) { "提示词不能为空" }
-        repeat(2) { attempt ->
-            val base = baseUrlProvider().trimEnd('/')
-            val url = "$base/AiText".toHttpUrlOrNull()
-                ?: throw ApiException("服务端地址无效")
-            val requestUrl = url.newBuilder()
-                .addQueryParameter("提示词", prompt)
-                .addQueryParameter("Cookie密钥", tokenManager.validToken())
-                .build()
-            val request = Request.Builder()
-                .url(requestUrl)
-                .post(ByteArray(0).toRequestBody(null))
-                .build()
-            ApiClient.longHttp.newCall(request).execute().use { response ->
-                val raw = response.body?.string().orEmpty()
-                when (response.code) {
-                    200 -> {
-                        val parsed = runCatching {
-                            ApiClient.json.decodeFromString(AiTextResponse.serializer(), raw)
-                        }.getOrElse {
-                            throw ApiException("AI 响应解析失败: ${raw.take(200)}")
+    private val jsonMedia = "application/json".toMediaType()
+
+    suspend fun generate(prompt: String, assistantPrompt: String = ""): String =
+        withContext(AppExecutors.dispatcher) {
+            require(prompt.isNotBlank()) { "提示词不能为空" }
+            repeat(2) { attempt ->
+                val body = ApiClient.json.encodeToString(
+                    AiTextRequest.serializer(),
+                    AiTextRequest(
+                        prompt = prompt,
+                        assistantPrompt = assistantPrompt,
+                        cookieKey = tokenManager.validToken(),
+                    ),
+                )
+                val request = Request.Builder()
+                    .url(baseUrlProvider().trimEnd('/') + "/AiText")
+                    .post(body.toRequestBody(jsonMedia))
+                    .build()
+                ApiClient.longHttp.newCall(request).execute().use { response ->
+                    val raw = response.body?.string().orEmpty()
+                    when (response.code) {
+                        200 -> {
+                            val parsed = runCatching {
+                                ApiClient.json.decodeFromString(AiTextResponse.serializer(), raw)
+                            }.getOrElse {
+                                throw ApiException("AI 响应解析失败: ${raw.take(200)}")
+                            }
+                            val content = parsed.result?.trim().orEmpty()
+                            if (content.isBlank()) throw ApiException("AI 未返回文案内容")
+                            return@withContext content
                         }
-                        val content = parsed.result?.trim().orEmpty()
-                        if (content.isBlank()) throw ApiException("AI 未返回文案内容")
-                        return@withContext content
-                    }
 
-                    401 -> {
-                        tokenManager.invalidate()
-                        if (attempt == 1) throw ApiException("令牌重注册后仍 401（服务端可能已重启）")
-                    }
+                        401 -> {
+                            tokenManager.invalidate()
+                            if (attempt == 1) throw ApiException("令牌重注册后仍 401（服务端可能已重启）")
+                        }
 
-                    else -> {
-                        val msg = runCatching {
-                            ApiClient.json.decodeFromString<ApiMessage>(raw).message
-                        }.getOrNull()
-                        throw ApiException(
-                            "AI 文案失败 HTTP ${response.code}: " +
-                                (msg ?: raw.take(200).ifBlank { "无响应体" })
+                        else -> throw ApiException(
+                            "AI 文案失败 HTTP ${response.code}: " + ApiClient.errorMessage(raw),
                         )
                     }
                 }
             }
+            throw IllegalStateException("unreachable")
         }
-        throw IllegalStateException("unreachable")
-    }
 }
 
 /**
@@ -491,15 +531,10 @@ class OcrClient(
                             if (attempt == 1) throw ApiException("令牌重注册后仍 401（服务端可能已重启）")
                         }
 
-                        else -> {
-                            val msg = runCatching {
-                                ApiClient.json.decodeFromString<ApiMessage>(raw).message
-                            }.getOrNull()
-                            throw ApiException(
-                                "OCR 失败 HTTP ${response.code}: " +
-                                    (msg ?: raw.take(200).ifBlank { "无响应体" })
-                            )
-                        }
+                        // 510 = 服务端 OCR 处理失败（message 给出原因）；未识别到文字是 200 + 空 result
+                        else -> throw ApiException(
+                            "OCR 失败 HTTP ${response.code}: " + ApiClient.errorMessage(raw),
+                        )
                     }
                 }
             }

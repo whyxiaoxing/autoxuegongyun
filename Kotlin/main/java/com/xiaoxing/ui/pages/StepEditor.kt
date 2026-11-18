@@ -25,6 +25,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.CheckCircle
@@ -72,7 +73,9 @@ import androidx.compose.ui.window.DialogProperties
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.xiaoxing.AppRepository
 import com.xiaoxing.HintLevel
+import com.xiaoxing.concurrent.AppExecutors
 import com.xiaoxing.config.IdentitySections
+import com.xiaoxing.config.ReportTypes
 import com.xiaoxing.photo.LocalTemplateStore
 import com.xiaoxing.ui.components.AppPickerDialog
 import com.xiaoxing.ui.components.AppSelectorField
@@ -80,6 +83,7 @@ import com.xiaoxing.ui.components.IconPlate
 import com.xiaoxing.ui.components.NumField
 import com.xiaoxing.ui.components.SignedNumField
 import com.xiaoxing.ui.components.SwipeRecorderDialog
+import com.xiaoxing.ui.components.TapRecorderDialog
 import com.xiaoxing.workflow.AiTextStep
 import com.xiaoxing.workflow.CLICK_OFFSET_LIMIT
 import com.xiaoxing.workflow.GlobalActionStep
@@ -98,6 +102,7 @@ import com.xiaoxing.workflow.SwipeStep
 import com.xiaoxing.workflow.TapStep
 import com.xiaoxing.workflow.WaitStep
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /** UI-side step catalogue. Serialization contract stays in workflow/Workflow.kt. */
 internal enum class StepType(
@@ -109,11 +114,12 @@ internal enum class StepType(
     WAIT("等待", "固定等待 N 毫秒", Icons.Filled.Refresh),
     MATCH("模板匹配", "截屏后识别并点击", Icons.Filled.Search),
     TAP("坐标点击", "点击固定坐标", Icons.Filled.Place),
+    BACK("返回", "按下系统返回键", Icons.AutoMirrored.Filled.ArrowBack),
     SWIPE("滑动", "两点之间滑动手势", Icons.AutoMirrored.Filled.ArrowForward),
     INPUT("输入文本", "写入当前输入框", Icons.Filled.Edit),
-    GLOBAL("全局动作", "返回或回到主屏", Icons.Filled.Home),
+    GLOBAL("回到主屏", "按下 Home 键回到桌面", Icons.Filled.Home),
     SCREENSHOT("保存凭证", "截图存入相册", Icons.Filled.CheckCircle),
-    AI_TEXT("AI 文案", "拼接身份信息并写入", Icons.Filled.Person),
+    AI_TEXT("AI 文案", "生成日/周/月报并写入", Icons.Filled.Person),
     PHOTO_MATCH("图片匹配", "本地图片模板匹配", Icons.Filled.Search),
     OCR("文字识别", "识别屏幕文字并点击", Icons.Filled.Search),
     IF("条件 IF", "条件成立则走对应分支", Icons.Filled.Check),
@@ -126,7 +132,9 @@ internal fun Step.toStepType(): StepType = when (this) {
     is TapStep -> StepType.TAP
     is SwipeStep -> StepType.SWIPE
     is InputTextStep -> StepType.INPUT
-    is GlobalActionStep -> StepType.GLOBAL
+    // 返回键与主屏键共用 GlobalActionStep：旧工作流里的 "back" 会直接显示成「返回」功能
+    is GlobalActionStep ->
+        if (action.equals("back", ignoreCase = true)) StepType.BACK else StepType.GLOBAL
     is SaveScreenshotStep -> StepType.SCREENSHOT
     is AiTextStep -> StepType.AI_TEXT
     is PhotoMatchStep -> StepType.PHOTO_MATCH
@@ -150,6 +158,7 @@ internal fun Step.summary(): String = when (this) {
     is GlobalActionStep -> if (action.equals("back", ignoreCase = true)) "返回键" else "回到主屏"
     is SaveScreenshotStep -> "保存截图「$tag」"
     is AiTextStep -> buildString {
+        ReportTypes.label(reportType).takeIf { it.isNotBlank() }?.let { append("$it · ") }
         append(
             if (sections.isEmpty()) "仅补充要求"
             else sections.joinToString("、") { IdentitySections.label(it) },
@@ -189,11 +198,12 @@ internal fun StepType.defaultStep(matchTemplate: String = ""): Step = when (this
     StepType.WAIT -> WaitStep(ms = 1500)
     StepType.MATCH -> MatchStep(template = matchTemplate)
     StepType.TAP -> TapStep(x = 0, y = 0)
+    StepType.BACK -> GlobalActionStep(action = "back")
     StepType.SWIPE -> SwipeStep(x1 = 0, y1 = 0, x2 = 0, y2 = 0)
     StepType.INPUT -> InputTextStep(text = "")
-    StepType.GLOBAL -> GlobalActionStep(action = "back")
+    StepType.GLOBAL -> GlobalActionStep(action = "home")
     StepType.SCREENSHOT -> SaveScreenshotStep(tag = "凭证")
-    StepType.AI_TEXT -> AiTextStep(sections = IdentitySections.all.map { it.key })
+    StepType.AI_TEXT -> AiTextStep(sections = IdentitySections.prompt.map { it.key })
     StepType.PHOTO_MATCH -> PhotoMatchStep(template = "")
     StepType.OCR -> OcrStep(keyword = "")
     StepType.IF -> IfStep(condition = IF_CONDITION_MATCH, template = matchTemplate)
@@ -203,18 +213,17 @@ internal fun StepType.defaultStep(matchTemplate: String = ""): Step = when (this
  * 工作流的运行参数。
  *
  * 目标应用与运行参数都下放到功能库的「启动应用」功能里：工作流不再提供统一设置，
- * 编辑启动应用时一并编辑这两项，保存步骤后写回工作流草稿。
+ * 编辑启动应用时一并编辑这一项，保存步骤后写回工作流草稿。
+ * 失败重试不再有独立参数：统一使用功能库「流程控制 → 失败重复次数」。
  */
 internal data class RunParameters(
     val intervalMs: Long,
-    val maxRetries: Int,
 )
 
 /**
  * Parameter sheet. Type is chosen by the function library; this surface only shapes the step.
  *
  * @param runInterval 当前工作流轮询间隔（仅「启动应用」展示，随步骤一起保存）
- * @param runRetries 当前工作流动作重试次数（仅「启动应用」展示，随步骤一起保存）
  * @param showRunParameters 顶层「启动应用」才编辑运行参数；IF 块内步骤只读
  * @param onDelete 传入时显示删除入口（流程页/功能库页的步骤都通过这里移除）
  */
@@ -223,7 +232,6 @@ internal data class RunParameters(
 internal fun StepEditorSheet(
     base: Step,
     runInterval: String,
-    runRetries: String,
     showRunParameters: Boolean = true,
     onDismiss: () -> Unit,
     onConfirm: (Step, RunParameters?) -> Unit,
@@ -232,7 +240,13 @@ internal fun StepEditorSheet(
     val type = base.toStepType()
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
-    val localTemplates = remember(context) { LocalTemplateStore.list(context).map { it.name } }
+    // 本地模板目录在后台线程读取：旧实现把目录列举/文件属性放进组合，主线程打开面板会掉帧
+    var localTemplates by remember(context) { mutableStateOf(emptyList<String>()) }
+    LaunchedEffect(context) {
+        localTemplates = withContext(AppExecutors.dispatcher) {
+            LocalTemplateStore.list(context).map { it.name }
+        }
+    }
     val identity by AppRepository.identityInfo.collectAsStateWithLifecycle()
     val templateNames by AppRepository.templateNames.collectAsStateWithLifecycle()
     val templateNamesLoading by AppRepository.templateNamesLoading.collectAsStateWithLifecycle()
@@ -256,12 +270,17 @@ internal fun StepEditorSheet(
     var y2 by remember(base) { mutableStateOf((base as? SwipeStep)?.y2?.toString() ?: "0") }
     var swipeMs by remember(base) { mutableStateOf((base as? SwipeStep)?.durationMs?.toString() ?: "300") }
     var text by remember(base) { mutableStateOf((base as? InputTextStep)?.text ?: "") }
-    var action by remember(base) { mutableStateOf((base as? GlobalActionStep)?.action ?: "back") }
     var tag by remember(base) { mutableStateOf((base as? SaveScreenshotStep)?.tag ?: "凭证") }
+    // 提示词只包含正文段；旧流程混在 sections 里的实习单位/身份描述（走 assistant）会被丢弃
     var aiSections by remember(base) {
         mutableStateOf(
-            (base as? AiTextStep)?.sections ?: IdentitySections.all.map { it.key },
+            (base as? AiTextStep)?.sections
+                ?.filter { key -> IdentitySections.prompt.any { it.key == key } }
+                ?: IdentitySections.prompt.map { it.key },
         )
+    }
+    var aiReportType by remember(base) {
+        mutableStateOf((base as? AiTextStep)?.reportType ?: ReportTypes.NONE)
     }
     var aiInstruction by remember(base) { mutableStateOf((base as? AiTextStep)?.instruction ?: "") }
     var aiInputResult by remember(base) { mutableStateOf((base as? AiTextStep)?.inputResult ?: true) }
@@ -317,11 +336,11 @@ internal fun StepEditorSheet(
     var optional by remember(base) { mutableStateOf(base.optional) }
     // 运行参数只在「启动应用」功能里设置（工作流不再统一设置）
     var intervalDraft by remember(base) { mutableStateOf(runInterval) }
-    var retriesDraft by remember(base) { mutableStateOf(runRetries) }
     // 底部弹窗是独立窗口，顶层提示会被盖住；表单错误同时在这里就地显示
     var validationError by remember(base) { mutableStateOf<String?>(null) }
     var showDeleteConfirm by remember(base) { mutableStateOf(false) }
     var showSwipeRecorder by remember(base) { mutableStateOf(false) }
+    var showTapRecorder by remember(base) { mutableStateOf(false) }
 
     fun branchSteps(branch: StepBranch): List<Step> = when (branch) {
         StepBranch.THEN -> thenSteps
@@ -399,14 +418,9 @@ internal fun StepEditorSheet(
                             { intervalDraft = it },
                             Modifier.fillMaxWidth(),
                         )
-                        NumField(
-                            "动作重试次数",
-                            retriesDraft,
-                            { retriesDraft = it },
-                            Modifier.fillMaxWidth(),
-                        )
                         Text(
-                            "运行参数作用于整条工作流：间隔用于匹配轮询与步骤间停顿，重试用于点击、滑动等动作失败后的重放。",
+                            "轮询间隔作用于整条工作流：模板匹配/文字识别的轮询节奏，以及步骤之间的停顿。" +
+                                "失败重试统一在功能库「流程控制 → 失败重复次数」里设置。",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
@@ -480,9 +494,26 @@ internal fun StepEditorSheet(
                     )
                 }
 
-                StepType.TAP -> Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    NumField("X", x, { x = it }, Modifier.weight(1f))
-                    NumField("Y", y, { y = it }, Modifier.weight(1f))
+                StepType.TAP -> {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            "点击位置",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.weight(1f),
+                        )
+                        TextButton(onClick = { showTapRecorder = true }) { Text("录制点击") }
+                    }
+                    Text(
+                        "点「录制点击」后在屏幕上轻点目标位置，自动填入 X/Y；" +
+                            "坐标就是执行时使用的屏幕像素，无需再试凑。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        NumField("X", x, { x = it }, Modifier.weight(1f))
+                        NumField("Y", y, { y = it }, Modifier.weight(1f))
+                    }
                 }
 
                 StepType.SWIPE -> {
@@ -521,21 +552,17 @@ internal fun StepEditorSheet(
                     modifier = Modifier.fillMaxWidth(),
                 )
 
-                StepType.GLOBAL -> {
-                    Text("动作", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        FilterChip(
-                            selected = action == "back",
-                            onClick = { action = "back" },
-                            label = { Text("返回") },
-                        )
-                        FilterChip(
-                            selected = action == "home",
-                            onClick = { action = "home" },
-                            label = { Text("回到主屏") },
-                        )
-                    }
-                }
+                StepType.BACK -> Text(
+                    "执行时按下系统返回键（等同于系统导航的「返回」）。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+
+                StepType.GLOBAL -> Text(
+                    "执行时回到系统主屏（等同于按 Home 键）。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
 
                 StepType.SCREENSHOT -> OutlinedTextField(
                     value = tag,
@@ -546,6 +573,68 @@ internal fun StepEditorSheet(
                 )
 
                 StepType.AI_TEXT -> {
+                    Text(
+                        "assistant 身份",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Text(
+                        if (identity.assistantIdentity) {
+                            "实习单位与身份描述默认作为 assistant 内容发送；" +
+                                "可在 设置 → 身份信息 里关闭。"
+                        } else {
+                            "实习单位与身份描述当前不发送；可在 设置 → 身份信息 里开启。"
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Text(
+                        "报告类型",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    FlowRow(
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        FilterChip(
+                            selected = aiReportType == ReportTypes.NONE,
+                            onClick = { aiReportType = ReportTypes.NONE },
+                            label = { Text("不指定") },
+                        )
+                        ReportTypes.all.forEach { type ->
+                            FilterChip(
+                                selected = aiReportType == type.key,
+                                onClick = {
+                                    aiReportType = type.key
+                                    // 报告类型决定使用哪一份报告素材：只保留这一种正文段
+                                    val otherReportKeys = ReportTypes.all
+                                        .filter { it.key != type.key }
+                                        .map { it.sectionKey }
+                                        .toSet()
+                                    aiSections = (aiSections - otherReportKeys + type.sectionKey)
+                                        .distinct()
+                                },
+                                label = { Text(type.label) },
+                            )
+                        }
+                    }
+                    if (aiReportType != ReportTypes.NONE) {
+                        Text(
+                            "选择报告类型后，提示词会自动改用对应报告素材，" +
+                                "assistant 末尾追加「这是一份${ReportTypes.label(aiReportType)}」。",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    val assistantPreview = identity.buildAssistant(aiSections, aiReportType)
+                    if (assistantPreview.isNotBlank()) {
+                        Text(
+                            "assistant 预览：\n$assistantPreview",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Text(
                             "提示词内容",
@@ -554,7 +643,7 @@ internal fun StepEditorSheet(
                             modifier = Modifier.weight(1f),
                         )
                         TextButton(onClick = {
-                            aiSections = IdentitySections.all.map { it.key }
+                            aiSections = IdentitySections.prompt.map { it.key }
                         }) { Text("全选") }
                         TextButton(onClick = { aiSections = emptyList() }) { Text("清空") }
                     }
@@ -562,7 +651,7 @@ internal fun StepEditorSheet(
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                         verticalArrangement = Arrangement.spacedBy(6.dp),
                     ) {
-                        IdentitySections.all.forEach { section ->
+                        IdentitySections.prompt.forEach { section ->
                             val selected = section.key in aiSections
                             FilterChip(
                                 selected = selected,
@@ -578,7 +667,7 @@ internal fun StepEditorSheet(
                         }
                     }
                     Text(
-                        "选中的段按固定顺序拼接；设置里为空的段会自动跳过。",
+                        "选中的正文段按固定顺序拼进提示词；设置里为空的段会自动跳过。",
                         style = MaterialTheme.typography.labelSmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -839,8 +928,8 @@ internal fun StepEditorSheet(
                         onDelete = { elseSteps = elseSteps.toMutableList().apply { removeAt(it) } },
                     )
                     Text(
-                        "块内步骤失败时：可选块跳过剩余步骤并继续；非可选块按普通步骤失败处理，" +
-                            "由工作流的「失败重复次数」决定是否整条重放。",
+                        "块内步骤失败时：每个步骤先按「失败重复次数」就地重试；" +
+                            "可选块重试耗尽后跳过剩余步骤并继续，非可选块则中止整条流程。",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
@@ -886,14 +975,11 @@ internal fun StepEditorSheet(
                         val error = when (type) {
                             StepType.LAUNCH -> {
                                 val intervalValue = intervalDraft.toLongOrNull()
-                                val retriesValue = retriesDraft.toIntOrNull()
                                 when {
                                     pkg.isBlank() -> "请选择要启动的目标应用"
                                     !showRunParameters -> null
                                     intervalValue == null || intervalValue <= 0 ->
                                         "轮询间隔需为大于 0 的整数"
-                                    retriesValue == null || retriesValue < 0 ->
-                                        "重试次数需为不小于 0 的整数"
                                     else -> null
                                 }
                             }
@@ -912,7 +998,7 @@ internal fun StepEditorSheet(
                                 else null
                             StepType.AI_TEXT ->
                                 if (aiSections.isEmpty() && aiInstruction.isBlank()) {
-                                    "AI 文案至少选择一段身份信息或填写补充要求"
+                                    "AI 文案至少选择一段提示词内容或填写补充要求"
                                 } else null
                             StepType.PHOTO_MATCH -> when {
                                 photoTemplate.isBlank() -> "请先选择本地图片模板"
@@ -967,7 +1053,8 @@ internal fun StepEditorSheet(
                                         optional = optional,
                                     )
                                     StepType.INPUT -> InputTextStep(text = text, optional = optional)
-                                    StepType.GLOBAL -> GlobalActionStep(action = action, optional = optional)
+                                    StepType.BACK -> GlobalActionStep(action = "back", optional = optional)
+                                    StepType.GLOBAL -> GlobalActionStep(action = "home", optional = optional)
                                     StepType.SCREENSHOT -> SaveScreenshotStep(
                                         tag = tag.ifBlank { "凭证" },
                                         optional = optional,
@@ -975,6 +1062,7 @@ internal fun StepEditorSheet(
                                     StepType.AI_TEXT -> AiTextStep(
                                         sections = aiSections,
                                         instruction = aiInstruction.trim(),
+                                        reportType = aiReportType,
                                         inputResult = aiInputResult,
                                         optional = optional,
                                     )
@@ -1013,10 +1101,7 @@ internal fun StepEditorSheet(
                                     )
                                 },
                                 if (type == StepType.LAUNCH && showRunParameters) {
-                                    RunParameters(
-                                        intervalMs = intervalDraft.toLong(),
-                                        maxRetries = retriesDraft.toInt(),
-                                    )
+                                    RunParameters(intervalMs = intervalDraft.toLong())
                                 } else {
                                     null
                                 },
@@ -1196,6 +1281,17 @@ internal fun StepEditorSheet(
         )
     }
 
+    if (showTapRecorder) {
+        TapRecorderDialog(
+            onDismiss = { showTapRecorder = false },
+            onRecorded = { tapX, tapY ->
+                x = tapX.toString()
+                y = tapY.toString()
+                showTapRecorder = false
+            },
+        )
+    }
+
     addToBranch?.let { branch ->
         StepTypePickerDialog(
             onDismiss = { addToBranch = null },
@@ -1219,7 +1315,6 @@ internal fun StepEditorSheet(
             StepEditorSheet(
                 base = child,
                 runInterval = runInterval,
-                runRetries = runRetries,
                 showRunParameters = false,
                 onDismiss = { childEdit = null },
                 onConfirm = { updated, _ ->

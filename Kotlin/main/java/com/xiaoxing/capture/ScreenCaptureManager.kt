@@ -52,7 +52,8 @@ import kotlinx.coroutines.withContext
  *   现改为主动采样：帧池每 500ms acquireLatestImage 采集一帧 → 复用池中的 Bitmap → 发布；
  *   采集时保持帧开启直接取最新缓存帧；保持帧关闭则等一个采样周期内的新采样帧。
  *   「保持帧」由页面开关控制（AppRepository.holdFrame，默认开）。
- *   「保存截图内容」开启时，每次捕获的 PNG 经 MediaStore 存入相册 DCIM/AutoGongxueyun（AppRepository.saveScreenshots）。
+ *   「保存截图内容」开启时，每个新帧的 PNG 经 MediaStore 存入相册 DCIM/AutoGongxueyun，
+ *   同一帧的重复轮询不会重复写盘（AppRepository.saveScreenshots）。
  *
  * 内存策略：
  *   - ImageReader 只保留 2 个全屏缓冲；
@@ -122,6 +123,9 @@ class ScreenCaptureManager(private val context: Context) {
     /** 「保存截图内容」已落盘的张数（用于首张落盘时提示目录，避免日志刷屏） */
     private val savedCounter = AtomicLong(0L)
 
+    /** 已自动落盘的帧号：同一帧（画面静止）只写一次相册，避免轮询时重复写盘。 */
+    private val lastAutoSavedFrameId = AtomicLong(-1L)
+
     /** 采样开关（stop 置 false，采样任务自行退出） */
     private val sampling = AtomicBoolean(false)
 
@@ -164,6 +168,12 @@ class ScreenCaptureManager(private val context: Context) {
     }
 
     val isReady: Boolean get() = imageReader != null
+
+    /**
+     * 当前发布帧号（0 = 尚无帧）。同一帧号代表画面没有更新：
+     * 工作流轮询识别时可直接复用上一轮结果，不必把同一张截图重复发给服务端。
+     */
+    val currentFrameId: Long get() = frameCounter.get()
 
     fun start(projectionResultData: Intent) {
         stop()
@@ -225,15 +235,18 @@ class ScreenCaptureManager(private val context: Context) {
     /**
      * 截一帧并返回 PNG 字节（保存路径直接使用，避免 base64 往返）。
      * 压缩期间帧由引用计数保护，采样线程不会复用/回收该位图。
+     *
+     * 这里不再触发「保存截图内容」：调用方（saveScreenshot 步骤）会自己带标签落盘，
+     * 否则一次截图会产生两份相册文件。
      */
-    suspend fun capturePngBytes(): ByteArray = captureEncoded().png
+    suspend fun capturePngBytes(): ByteArray = captureEncoded(autoSave = false).png
 
     /**
      * 截一帧并返回 PNG Base64（保持 /See 原有 String 入参不变）。
      * 同一帧的 PNG/Base64 都会缓存，静止画面轮询不会反复编码。
      *
      * 保持帧开启 → 直接取最新缓存帧；保持帧关闭 → 等一个采样周期内的新采样帧，没有则失败。
-     * 「保存截图内容」开启时，返回前把本次 PNG 落盘。
+     * 「保存截图内容」开启时，每个新帧落盘一次（同一帧的重复轮询不会重复写相册）。
      */
     suspend fun capturePngBase64(): String {
         val capture = captureEncoded()
@@ -251,14 +264,14 @@ class ScreenCaptureManager(private val context: Context) {
         }
     }
 
-    private suspend fun captureEncoded(): EncodedCapture {
+    private suspend fun captureEncoded(autoSave: Boolean = true): EncodedCapture {
         val frame = acquireFrame()
         val png = try {
             encodePng(frame)
         } finally {
             releaseFrame(frame)
         }
-        saveScreenshotIfEnabled(png)
+        if (autoSave) saveScreenshotIfEnabled(frame.id, png)
         return EncodedCapture(frame.id, png)
     }
 
@@ -343,6 +356,7 @@ class ScreenCaptureManager(private val context: Context) {
         }
         frameCounter.set(0L)
         savedCounter.set(0L)
+        lastAutoSavedFrameId.set(-1L)
         previewAtMs = 0L
         packedBuffer = null
         if (active === this) active = null
@@ -507,8 +521,11 @@ class ScreenCaptureManager(private val context: Context) {
      *
      * 直接写 PNG 字节，不再 base64 → decode 往返。
      */
-    private suspend fun saveScreenshotIfEnabled(pngBytes: ByteArray) {
+    private suspend fun saveScreenshotIfEnabled(frameId: Long, pngBytes: ByteArray) {
         if (!AppRepository.saveScreenshots.value) return
+        // 画面静止时 match 轮询会反复取到同一帧：同一帧只落盘一次，
+        // 否则开启「保存截图内容」后相册会被重复截图迅速塞满，轮询也被写盘拖慢。
+        if (lastAutoSavedFrameId.getAndSet(frameId) == frameId) return
         withContext(AppExecutors.dispatcher) {
             val seq = savedCounter.incrementAndGet()
             runCatching {

@@ -1,6 +1,7 @@
 package com.xiaoxing
 
 import android.app.Application
+import com.xiaoxing.log.AppLog
 
 /**
  * 进程级初始化 + 内存压力回调。
@@ -13,6 +14,7 @@ class AutoGongxueyunApp : Application() {
     override fun onCreate() {
         super.onCreate()
         AppRepository.init(this)
+        AppLog.info("应用", "进程启动")
     }
 
     override fun onTrimMemory(level: Int) {

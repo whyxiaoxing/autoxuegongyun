@@ -26,6 +26,7 @@ object AppListHelper {
                 AppEntry(label = label, packageName = pkg)
             }
             .distinctBy { it.packageName }
-            .sortedBy { it.label.lowercase() }
+            // 不区分大小写排序，但不再为每个应用名分配一份 lowercase 字符串
+            .sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { it.label })
     }
 }

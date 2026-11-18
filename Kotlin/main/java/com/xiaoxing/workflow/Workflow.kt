@@ -1,6 +1,7 @@
 package com.xiaoxing.workflow
 
 import com.xiaoxing.config.IdentitySections
+import com.xiaoxing.config.ReportTypes
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
@@ -33,7 +34,7 @@ object TemplateRegistry {
 /** 模板匹配点击偏移的绝对值上限（像素），编辑页与校验共用 */
 const val CLICK_OFFSET_LIMIT = 200
 
-/** 整条流程失败后的最大重复次数（首次执行不计入），编辑页与校验共用 */
+/** 单个步骤失败后的最大重试次数（首次执行不计入），编辑页与校验共用 */
 const val MAX_FAILURE_RETRIES = 10
 
 /** IF 条件类型：服务端模板匹配（/See） */
@@ -126,16 +127,26 @@ data class SaveScreenshotStep(
 ) : Step()
 
 /**
- * AI 文案：把「身份信息」中选中的段拼成提示词，调用 `/AiText`，再把返回文案写入当前聚焦输入框。
+ * AI 文案：把「身份信息」拆成 assistant 内容与 user 提示词，调用 `/AiText`，
+ * 再把返回文案写入当前聚焦输入框。
  *
- * 只保存选择（sections）与补充要求，实际内容实时读取设置页 —— 身份信息更新后无需改工作流。
- * sections 取值为 [com.xiaoxing.config.IdentitySections] 的 key。
+ *  - assistant：实习单位/身份描述（设置里可关闭默认发送）+ 报告类型「这是一份周报」；
+ *  - 提示词：[sections] 选中的正文段（今日事件/日报/周报/月报）+ [instruction]。
+ *
+ * 只保存选择（sections）、报告类型与补充要求，实际内容实时读取设置页 —— 身份信息更新后无需改工作流。
+ * 编辑器只保存 [com.xiaoxing.config.IdentitySections.prompt] 的 key；
+ * 旧流程 sections 里残留的 unit/role 会被当作 assistant 身份段发送（以便平滑迁移）。
  */
 @Serializable
 @SerialName("aiText")
 data class AiTextStep(
     val sections: List<String> = emptyList(),
     val instruction: String = "",
+    /**
+     * 报告类型：[com.xiaoxing.config.ReportTypes] 的 key（daily/weekly/monthly）；
+     * 空串 = 不指定。选择后 assistant 内容以「这是一份日报/周报/月报」收尾。
+     */
+    val reportType: String = "",
     /** 生成后写入当前聚焦输入框（关闭时只生成不写入，用于调试/预览） */
     val inputResult: Boolean = true,
     override val optional: Boolean = false,
@@ -169,7 +180,8 @@ data class PhotoMatchStep(
  *  - timeoutMs 内命中 → 执行 [thenSteps]；超时未命中（或请求一直失败）→ 执行 [elseSteps]。
  *
  * [optional] 只作用于块内步骤：块内任一非可选步骤失败时，可选块会跳过剩余步骤并继续执行后续流程；
- * 非可选块则中止整条流程，并像普通步骤失败一样触发工作流的「失败重复次数」。
+ * 非可选块则中止整条流程（块内步骤失败时已各自按「失败重复次数」重试过）。
+ * 条件不成立只是走「否则分支」，不算失败。
  */
 @Serializable
 @SerialName("if")
@@ -218,11 +230,12 @@ data class Workflow(
     @SerialName("targetPackage") val targetPackage: String = "",
     /** match 步骤轮询间隔（在「启动应用」步骤面板里编辑） */
     @SerialName("intervalMs") val intervalMs: Long = 1000,
-    /** 动作类步骤（tap/swipe/input/global/launch）重试次数（在「启动应用」步骤面板里编辑） */
-    @SerialName("maxRetries") val maxRetries: Int = 3,
     /**
-     * 整条流程失败后的重复次数（在功能库「流程控制」里编辑）。
-     * 非可选步骤失败导致流程中止时，从头再执行整条流程；0 = 失败即停止。
+     * 每个功能失败后的重试次数（在功能库「流程控制」里编辑）。
+     * 某一步失败时就地重试该步骤（模板匹配超时、动作失败等统统一视同仁），
+     * 不再是整条流程从头重放；0 = 失败即停止（不重试）。
+     *
+     * 旧版 JSON 里的 `maxRetries` 会被忽略（ignoreUnknownKeys）。
      */
     @SerialName("failureRetries") val failureRetries: Int = 0,
     val steps: List<Step> = emptyList(),
@@ -239,29 +252,46 @@ val Workflow.effectiveTargetPackage: String
     get() {
         val raw = targetPackage.trim()
         val workflowTarget = if (raw == SKELETON_PLACEHOLDER_PKG) "" else raw
-        return workflowTarget.ifBlank {
-            steps.flattenSteps().filterIsInstance<LaunchStep>()
-                .firstOrNull { it.packageName.isNotBlank() }
-                ?.packageName
-                ?.trim()
-                .orEmpty()
-        }
+        return workflowTarget.ifBlank { steps.firstLaunchPackage() }
     }
+
+/**
+ * 深度优先查找第一个指定了包名的「启动应用」步骤，顺序与 [flattenSteps] 一致。
+ * 直接递归查找，不再先展开整条流程再过滤（列表刷新/首页摘要都会走到这里）。
+ */
+private fun List<Step>.firstLaunchPackage(): String =
+    firstNotNullOfOrNull { step ->
+        when (step) {
+            is LaunchStep -> step.packageName.trim().takeIf { it.isNotEmpty() }
+
+            is IfStep -> step.thenSteps.firstLaunchPackage()
+                .ifEmpty { step.elseSteps.firstLaunchPackage() }
+                .takeIf { it.isNotEmpty() }
+
+            else -> null
+        }
+    }.orEmpty()
 
 /**
  * 深度展开步骤：IF 的两个分支会展开到同一列表（块本身保留在最前）。
  *
  * 初始化预检（模板/截屏/无障碍/目标 App）和校验都基于展开后的列表，
  * 避免嵌套在控制流里的步骤绕过依赖检查。
+ *
+ * 用 [buildList] 单次分配构建（旧实现的 flatMap + listOf + `+` 会在每一层产生
+ * 多份中间列表，深层/多分支流程的预处理开销与 GC 压力都会被放大）。
  */
-fun List<Step>.flattenSteps(): List<Step> = flatMap { step ->
-    listOf(step) + when (step) {
-        is IfStep -> step.thenSteps.flattenSteps() + step.elseSteps.flattenSteps()
-        is MatchStep, is PhotoMatchStep, is AiTextStep, is LaunchStep, is WaitStep,
-        is TapStep, is SwipeStep, is InputTextStep, is GlobalActionStep,
-        is SaveScreenshotStep, is OcrStep,
-        -> emptyList()
+fun List<Step>.flattenSteps(): List<Step> = buildList {
+    fun addDeep(steps: List<Step>) {
+        for (step in steps) {
+            add(step)
+            if (step is IfStep) {
+                addDeep(step.thenSteps)
+                addDeep(step.elseSteps)
+            }
+        }
     }
+    addDeep(this@flattenSteps)
 }
 
 object WorkflowCodec {
@@ -292,7 +322,7 @@ object WorkflowCodec {
         if (workflow.name.isBlank()) add("name 不能为空")
         if (workflow.steps.isEmpty()) add("steps 不能为空")
         if (workflow.failureRetries !in 0..MAX_FAILURE_RETRIES) {
-            add("failureRetries 需在 0..$MAX_FAILURE_RETRIES 之间（失败后整条流程重复次数）")
+            add("failureRetries 需在 0..$MAX_FAILURE_RETRIES 之间（每个步骤失败后的重试次数）")
         }
         validateSteps(workflow.steps, "步骤")
     }
@@ -316,14 +346,22 @@ object WorkflowCodec {
                 }
 
                 is GlobalActionStep ->
-                    if (step.action.lowercase() !in setOf("back", "home")) add("$label: 未知全局动作「${step.action}」")
+                    if (
+                        !step.action.equals("back", ignoreCase = true) &&
+                        !step.action.equals("home", ignoreCase = true)
+                    ) {
+                        add("$label: 未知全局动作「${step.action}」")
+                    }
 
                 is AiTextStep -> {
                     if (step.sections.isEmpty() && step.instruction.isBlank()) {
-                        add("$label: AI 文案至少选择一段身份信息或填写补充要求")
+                        add("$label: AI 文案至少选择一段提示词内容或填写补充要求")
                     }
                     val unknown = step.sections.filter { IdentitySections.find(it) == null }
                     if (unknown.isNotEmpty()) add("$label: 未知身份信息段 ${unknown.joinToString()}")
+                    if (step.reportType.isNotBlank() && ReportTypes.find(step.reportType) == null) {
+                        add("$label: 未知报告类型「${step.reportType}」")
+                    }
                 }
 
                 is PhotoMatchStep -> {

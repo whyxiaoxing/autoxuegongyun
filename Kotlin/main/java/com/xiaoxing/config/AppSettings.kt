@@ -100,6 +100,7 @@ object SettingsStore {
     private val IDENTITY_DAILY_REPORT = stringPreferencesKey("identity_daily_report")
     private val IDENTITY_WEEKLY_REPORT = stringPreferencesKey("identity_weekly_report")
     private val IDENTITY_MONTHLY_REPORT = stringPreferencesKey("identity_monthly_report")
+    private val IDENTITY_ASSISTANT = booleanPreferencesKey("identity_assistant")
 
     private lateinit var appContext: Context
 
@@ -180,6 +181,7 @@ object SettingsStore {
                 dailyReport = it[IDENTITY_DAILY_REPORT].orEmpty(),
                 weeklyReport = it[IDENTITY_WEEKLY_REPORT].orEmpty(),
                 monthlyReport = it[IDENTITY_MONTHLY_REPORT].orEmpty(),
+                assistantIdentity = it[IDENTITY_ASSISTANT] ?: true,
             )
         }
     }
@@ -247,6 +249,7 @@ object SettingsStore {
             it[IDENTITY_DAILY_REPORT] = info.dailyReport.trim()
             it[IDENTITY_WEEKLY_REPORT] = info.weeklyReport.trim()
             it[IDENTITY_MONTHLY_REPORT] = info.monthlyReport.trim()
+            it[IDENTITY_ASSISTANT] = info.assistantIdentity
         }
     }
 }

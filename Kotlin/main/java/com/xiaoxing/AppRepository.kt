@@ -14,6 +14,7 @@ import com.xiaoxing.config.ServerConfig
 import com.xiaoxing.config.SettingsStore
 import com.xiaoxing.config.ThemeMode
 import com.xiaoxing.concurrent.AppExecutors
+import com.xiaoxing.log.AppLog
 import com.xiaoxing.network.AiTextClient
 import com.xiaoxing.network.OcrClient
 import com.xiaoxing.network.SeeClient
@@ -192,7 +193,8 @@ object AppRepository {
         scope.launch { SettingsStore.themeMode.collect { themeMode.value = it } }
         scope.launch { SettingsStore.identityInfo.collect { identityInfo.value = it } }
         scope.launch { refreshWorkflows(ctx) }
-        KeepAliveWorker.schedule(ctx)
+        // WorkManager 首次 getInstance 会做磁盘初始化，不在 Application.onCreate 主线程上等
+        scope.launch { KeepAliveWorker.schedule(ctx) }
     }
 
     /**
@@ -257,6 +259,12 @@ object AppRepository {
     fun showHint(message: String, level: HintLevel = HintLevel.INFO) {
         val text = message.trim()
         if (text.isBlank()) return
+        // 所有面向用户的反馈同时进运行日志，方便事后回看本次运行发生了什么
+        when (level) {
+            HintLevel.INFO, HintLevel.SUCCESS -> AppLog.info("提示", text)
+            HintLevel.WARNING -> AppLog.warn("提示", text)
+            HintLevel.ERROR -> AppLog.error("提示", text)
+        }
         hint.value = AppHint(hintSeq.incrementAndGet(), text, level)
     }
 
@@ -448,7 +456,6 @@ object AppRepository {
               "name": "$name",
               "targetPackage": "",
               "intervalMs": 1000,
-              "maxRetries": 3,
               "steps": [
                 { "type": "launch" },
                 { "type": "wait", "ms": 3000 },

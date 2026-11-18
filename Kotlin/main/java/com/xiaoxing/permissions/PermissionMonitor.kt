@@ -8,7 +8,11 @@ import android.os.Looper
 import android.os.PowerManager
 import android.provider.Settings
 import com.xiaoxing.accessibility.AutomationAccessibilityService
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.launch
 
 /**
  * 权限状态实时监控（页面只读 StateFlow，不再各自 remember 一次性读取）：
@@ -26,12 +30,17 @@ object PermissionMonitor {
     @Volatile
     private var appContext: Context? = null
 
+    /** 权限查询走 binder IPC：放到后台线程，Application.onCreate 不在主线程做系统调用。 */
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
     private var registered = false
 
     private val settingsObserver = object : ContentObserver(Handler(Looper.getMainLooper())) {
         override fun onChange(selfChange: Boolean, uri: Uri?) {
             val ctx = appContext ?: return
-            accessibilityEnabled.value = AutomationAccessibilityService.isEnabled(ctx)
+            scope.launch {
+                accessibilityEnabled.value = AutomationAccessibilityService.isEnabled(ctx)
+            }
         }
     }
 
@@ -39,9 +48,9 @@ object PermissionMonitor {
     fun start(context: Context) {
         val ctx = context.applicationContext
         appContext = ctx
-        refresh(ctx)
         if (!registered) {
             registered = true
+            scope.launch { refresh(ctx) }
             val uri = Settings.Secure.getUriFor(Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES)
             ctx.contentResolver.registerContentObserver(uri, /* notifyForDescendants = */ false, settingsObserver)
         }

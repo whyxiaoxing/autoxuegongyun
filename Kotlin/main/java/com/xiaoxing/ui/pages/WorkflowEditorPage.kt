@@ -91,6 +91,16 @@ import kotlinx.coroutines.launch
 private const val PAGE_FLOW = 0
 private const val PAGE_LIBRARY = 1
 
+/** 功能库默认露出的排数（每排 2 个），其余功能在库区域内上下滑动查看 */
+private const val LIBRARY_VISIBLE_ROWS = 3
+
+/** 与 [FunctionTile] 的 52dp 最小高度、排间距 8dp 保持一致，用于锁定 3 排的可见高度 */
+private val LIBRARY_TILE_HEIGHT = 52.dp
+private val LIBRARY_ROW_GAP = 8.dp
+
+/** 功能库两列排布在进程内固定，提到顶层避免每次重组都重新 chunked。 */
+private val STEP_TYPE_ROWS = StepType.entries.chunked(2)
+
 /**
  * 工作流编辑分两页（底部切换）：
  *
@@ -117,8 +127,7 @@ internal fun WorkflowEditorPage(
     var wfName by rememberSaveable { mutableStateOf("") }
     // 运行参数不再有统一设置：只在「启动应用」步骤里编辑，这里保存草稿值
     var wfInterval by rememberSaveable { mutableStateOf("1000") }
-    var wfRetries by rememberSaveable { mutableStateOf("3") }
-    // 流程控制：整条流程失败后的重复次数（0 = 失败即停止）
+    // 流程控制：每个功能失败后的重试次数（0 = 不重试）
     var wfFailureRetries by rememberSaveable { mutableStateOf("0") }
     var stepsJson by rememberSaveable { mutableStateOf("") }
     var dirty by rememberSaveable { mutableStateOf(false) }
@@ -162,7 +171,6 @@ internal fun WorkflowEditorPage(
             originalName = initialName.orEmpty()
             wfName = workflow.name
             wfInterval = workflow.intervalMs.toString()
-            wfRetries = workflow.maxRetries.toString()
             wfFailureRetries = workflow.failureRetries.toString()
             stepsJson = WorkflowCodec.encodeCompact(workflow)
             dirty = false
@@ -180,7 +188,6 @@ internal fun WorkflowEditorPage(
             // 工作流不再保存默认目标应用：目标随「启动应用」步骤一起保存
             targetPackage = "",
             intervalMs = wfInterval.toLongOrNull() ?: 1000L,
-            maxRetries = wfRetries.toIntOrNull() ?: 3,
             failureRetries = (wfFailureRetries.toIntOrNull() ?: 0)
                 .coerceIn(0, MAX_FAILURE_RETRIES),
             steps = newSteps,
@@ -498,13 +505,11 @@ internal fun WorkflowEditorPage(
             StepEditorSheet(
                 base = step,
                 runInterval = wfInterval,
-                runRetries = wfRetries,
                 onDismiss = { editingIndex = -1 },
                 onConfirm = { updated, runParams ->
                     // 「启动应用」保存时会带回运行参数（工作流级字段，但没有其他入口编辑）
                     if (runParams != null) {
                         wfInterval = runParams.intervalMs.toString()
-                        wfRetries = runParams.maxRetries.toString()
                     }
                     val current = currentSteps()
                     if (editingIndex in current.indices) {
@@ -748,9 +753,10 @@ private fun LibraryPage(
             modifier = Modifier.fillMaxWidth(),
         )
         Text(
-            "整条流程因步骤失败中止后，从头再执行的次数；0 表示失败即停止（最多 $MAX_FAILURE_RETRIES 次）。" +
-                "失败次数耗尽时会震动并响铃提醒。" +
-                "IF 分支内的非可选步骤失败同样按这里的次数整条重放（IF 设为可选则跳过剩余分支）。",
+            "每个功能执行失败后就地重试该步骤的次数（首次执行不算，最多 $MAX_FAILURE_RETRIES 次），" +
+                "0 表示失败即停止。模板匹配超时、动作失败等都按这里的次数重试；" +
+                "重试耗尽仍失败时中止流程并震动响铃提醒。" +
+                "IF 分支内的每个步骤同样各自重试（IF 设为可选则跳过剩余分支）。",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.padding(horizontal = 4.dp),
@@ -764,20 +770,40 @@ private fun LibraryPage(
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.padding(horizontal = 4.dp),
         )
-        StepType.entries.chunked(2).forEach { rowTypes ->
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                rowTypes.forEach { type ->
-                    FunctionTile(
-                        type = type,
-                        onClick = { onAdd(type) },
-                        modifier = Modifier.weight(1f),
-                    )
+        // 只露出 3 排：高度锁定为 3 个格子 + 2 个排间距，多出来的功能在库区域内滑动查看
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(
+                    LIBRARY_TILE_HEIGHT * LIBRARY_VISIBLE_ROWS +
+                        LIBRARY_ROW_GAP * (LIBRARY_VISIBLE_ROWS - 1),
+                )
+                .verticalScroll(rememberScrollState()),
+            verticalArrangement = Arrangement.spacedBy(LIBRARY_ROW_GAP),
+        ) {
+            STEP_TYPE_ROWS.forEach { rowTypes ->
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    rowTypes.forEach { type ->
+                        FunctionTile(
+                            type = type,
+                            onClick = { onAdd(type) },
+                            modifier = Modifier.weight(1f),
+                        )
+                    }
+                    if (rowTypes.size == 1) Spacer(Modifier.weight(1f))
                 }
-                if (rowTypes.size == 1) Spacer(Modifier.weight(1f))
             }
+        }
+        if (STEP_TYPE_ROWS.size > LIBRARY_VISIBLE_ROWS) {
+            Text(
+                "上下滑动查看全部 ${StepType.entries.size} 个功能",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(horizontal = 4.dp),
+            )
         }
 
         Spacer(Modifier.height(4.dp))

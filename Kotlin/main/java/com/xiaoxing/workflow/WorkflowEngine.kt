@@ -10,18 +10,26 @@ import com.xiaoxing.capture.ScreenshotStore
 import com.xiaoxing.concurrent.AppExecutors
 import com.xiaoxing.config.IdentityInfo
 import com.xiaoxing.config.IdentitySections
+import com.xiaoxing.config.ReportTypes
 import com.xiaoxing.network.AiTextClient
 import com.xiaoxing.network.MatchOutcome
 import com.xiaoxing.network.OcrClient
 import com.xiaoxing.network.SeeClient
 import com.xiaoxing.photo.LocalTemplateStore
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.withContext
 
 /**
  * 工作流执行引擎（运行于前台服务协程作用域）。
@@ -32,13 +40,15 @@ import kotlinx.coroutines.ensureActive
  *
  * 步骤失败语义：
  *  - match / photoMatch：timeoutMs 内按 intervalMs 轮询（截屏→识别→点击），超时未匹配 = 失败
- *  - 动作类（launch/tap/swipe/inputText/globalAction）：按 maxRetries 重试
- *  - aiText：拼身份信息 → /AiText → 写入聚焦输入框
+ *  - 动作类（launch/tap/swipe/inputText/globalAction）：单次执行，失败由步骤级重试兜底
+ *  - aiText：assistant 内容取自身份信息（单位/身份描述 + 报告类型），
+ *    任务启动时即在 [AppExecutors.dispatcher] 预取 /AiText 结果，步骤执行时直接取用；
+ *    未预取（如运行中改了身份信息）才现取，然后写入聚焦输入框
  *  - ocr：截屏 → /OCRPhoto → 命中文字后可选点击
- *  - if：条件分支，按代码语义执行嵌套步骤（详见 [IfStep]）
- *  - 失败后：optional = true 跳过，否则中止整个工作流
- *  - 整条流程失败重复：非可选步骤中止后按 [Workflow.failureRetries] 从头重放（初始化不重跑）；
- *    IF 块内的失败同样参与重复（可选块则跳过剩余步骤并继续）
+ *  - if：条件分支，按代码语义执行嵌套步骤（详见 [IfStep]）；条件不成立不算失败
+ *  - 失败后：按 [Workflow.failureRetries] 就地重试该步骤（首次执行不计入），
+ *    重试仍失败时 optional = true 跳过，否则中止整个工作流（不再整条流程重放）。
+ *    IF 块内的每个步骤同样各自重试；块内的非可选失败直接上抛中止整条流程。
  */
 class WorkflowEngine(
     private val context: Context,
@@ -59,6 +69,16 @@ class WorkflowEngine(
     var onStatusChange: ((String) -> Unit)? = null
 
     /**
+     * 本次运行的 AI 文案预取：提示词 + assistant 内容 → 线程池里的生成任务。
+     * [run] 一开始就发起，步骤执行到 AI 文案时直接 await 结果，不再从零等待生成。
+     */
+    @Volatile
+    private var aiPrefetches: Map<AiPrompt, Deferred<Result<String>>> = emptyMap()
+
+    /** AI 文案请求的两段内容；相同组合只请求一次 */
+    private data class AiPrompt(val prompt: String, val assistant: String)
+
+    /**
      * @param awaitUserConfirm 投屏二次确认闸门（第二层闸门），入参是解析后的目标包名。
      *   返回 false = 用户取消/超时，不进入工作流。
      *   与 [initialize] 并行执行：用户下拉通知栏点「继续共享」的时间正好覆盖初始化耗时。
@@ -69,12 +89,32 @@ class WorkflowEngine(
         awaitUserConfirm: suspend (targetPackage: String) -> Boolean = { _ -> true },
     ) {
         val target = resolveTarget(workflow, fallbackPackage)
+        // 整条流程只展开一次：预取与初始化预检共用同一份步骤列表。
+        val allSteps = workflow.steps.flattenSteps()
         onStatusChange?.invoke("初始化: ${workflow.name}")
 
+        // AI 文案预取：一启动就把它丢进线程池（生成可能耗时数分钟），与初始化、投屏二次确认并行。
+        // 流程走到 AI 步骤时通常已经生成完毕，只等待剩余时间；生成任务随本次运行结束一起取消。
+        val prefetchScope = CoroutineScope(SupervisorJob() + AppExecutors.dispatcher)
+        aiPrefetches = startAiPrefetch(allSteps, prefetchScope)
+        try {
+            runInternal(workflow, allSteps, target, awaitUserConfirm)
+        } finally {
+            prefetchScope.cancel()
+            aiPrefetches = emptyMap()
+        }
+    }
+
+    private suspend fun runInternal(
+        workflow: Workflow,
+        allSteps: List<Step>,
+        target: String,
+        awaitUserConfirm: suspend (targetPackage: String) -> Boolean,
+    ) {
         // 初始化与「投屏二次确认」互不依赖，并行跑：总耗时 ≈ max(初始化, 用户确认)。
         // 用户取消时取消初始化（注意：内部阻塞中的 OkHttp 调用不可中断，会等它返回后立即抛出取消）。
         val (confirmed, initResult) = coroutineScope {
-            val initJob = async { initialize(workflow, target) }
+            val initJob = async { initialize(allSteps, target) }
             val confirmed = awaitUserConfirm(target)
             if (!confirmed) {
                 initJob.cancel()
@@ -96,28 +136,16 @@ class WorkflowEngine(
             )
         }
 
-        // 整条流程的失败重复：步骤失败中止后从头再执行，最多 workflow.failureRetries 次。
-        // 初始化不重复（依赖已在首次确认时就绪），只有步骤执行会被重放。
-        // IF 块内的失败也走这里：不再有独立于「失败重复次数」的控制流中止。
-        val totalRetries = workflow.failureRetries.coerceIn(0, MAX_FAILURE_RETRIES)
-        var retry = 0
-        while (true) {
-            try {
-                executeSteps(workflow.steps, target, workflow)
-                break
-            } catch (e: AbortException) {
-                if (retry >= totalRetries) throw e
-                retry++
-                onStatusChange?.invoke("失败，整条流程重试 $retry/$totalRetries: ${workflow.name}")
-                delay(WORKFLOW_RETRY_DELAY_MS)
-            }
-        }
+        // 「失败重复次数」是功能库内的步骤级重试（在 executeSteps 里消化），
+        // 这里不再有整条流程从头重放的第二层循环。
+        executeSteps(workflow.steps, target, workflow)
 
         onStatusChange?.invoke("完成: ${workflow.name}")
     }
 
     /**
-     * 按顺序执行一组步骤；非可选步骤失败时抛出 [AbortException]。
+     * 按顺序执行一组步骤。每个步骤失败后就地重试，次数 = [Workflow.failureRetries]；
+     * 重试耗尽仍失败时，非可选步骤抛出 [AbortException]，可选步骤跳过继续。
      *
      * @param prefix 嵌套块的状态前缀（缩进 + 分支名），顶层为空
      */
@@ -127,28 +155,48 @@ class WorkflowEngine(
         workflow: Workflow,
         prefix: String = "",
     ) {
+        val retries = workflow.failureRetries.coerceIn(0, MAX_FAILURE_RETRIES)
         steps.forEachIndexed { index, step ->
             val desc = describe(step)
-            onStatusChange?.invoke("$prefix[${index + 1}/${steps.size}] $desc")
+            var lastDetail: String? = null
+            var succeeded = false
+            var attempt = 0
 
-            val result = runCatching { execute(step, target, workflow, prefix) }
-                .onFailure {
-                    if (it is CancellationException) throw it
-                    // 控制流块内的中止原因必须原样上抛（用于整条流程失败重复）
-                    if (it is AbortException) throw it
-                }
-                .getOrElse { e -> StepResult(false, "异常: ${e.message}") }
+            while (!succeeded) {
+                attempt++
+                onStatusChange?.invoke(
+                    buildString {
+                        append("$prefix[${index + 1}/${steps.size}] $desc")
+                        if (attempt > 1) append("（重试 ${attempt - 1}/$retries）")
+                    },
+                )
 
-            if (!result.ok) {
-                if (step.optional) {
-                    // 可选步骤失败不打断流程；状态会继续推进到下一步
+                val result = runCatching { execute(step, target, workflow, prefix) }
+                    .onFailure {
+                        if (it is CancellationException) throw it
+                        // 控制流块内的中止原因必须原样上抛：块内步骤已经各自重试过，
+                        // 这里不再对 IF 本身重试
+                        if (it is AbortException) throw it
+                    }
+                    .getOrElse { e -> StepResult(false, "异常: ${e.message}") }
+
+                if (result.ok) {
+                    succeeded = true
                 } else {
-                    onStatusChange?.invoke("${prefix}中止: $desc")
-                    val reason = result.detail?.let { "（$it）" }.orEmpty()
-                    throw AbortException("步骤失败，工作流中止: $desc$reason")
+                    lastDetail = result.detail
+                    // 共执行 1 + retries 次
+                    if (attempt > retries) break
+                    delay(RETRY_DELAY_MS)
                 }
             }
-            delay(workflow.intervalMs.coerceAtLeast(0))
+
+            if (!succeeded && !step.optional) {
+                onStatusChange?.invoke("${prefix}中止: $desc")
+                val reason = lastDetail?.let { "（$it）" }.orEmpty()
+                throw AbortException("步骤失败，工作流中止: $desc$reason")
+            }
+            // 最后一步之后不再空等：顶层直接结束，IF 块边界由外层 IF 步骤自身的停顿接管。
+            if (index != steps.lastIndex) delay(workflow.intervalMs.coerceAtLeast(0))
         }
     }
 
@@ -161,43 +209,78 @@ class WorkflowEngine(
      *  - 身份信息提示词非空（aiText）
      *  - 目标 App 可拉起（launch）
      */
-    private suspend fun initialize(workflow: Workflow, target: String): InitResult {
-        // IF 块内的步骤同样参与预检：展开后统一收集依赖
-        val allSteps = workflow.steps.flattenSteps()
-        val templates = (
-            allSteps.filterIsInstance<MatchStep>().map { it.template } +
-                // IF 的服务端模板条件同样走 /See，模板必须已在服务端注册
-                allSteps.filterIsInstance<IfStep>()
-                    .filter { it.condition == IF_CONDITION_MATCH }
-                    .map { it.template }
-            ).filter { it.isNotBlank() }.distinct()
-        val photoTemplates = (
-            allSteps.filterIsInstance<PhotoMatchStep>().map { it.template } +
-                // IF 的图片模板条件走 /See_Submit_Photo，本机模板必须存在
-                allSteps.filterIsInstance<IfStep>()
-                    .filter { it.condition == IF_CONDITION_PHOTO }
-                    .map { it.template }
-            ).filter { it.isNotBlank() }.distinct()
-        val needsServer = templates.isNotEmpty() ||
-            photoTemplates.isNotEmpty() ||
-            allSteps.any {
-                it is AiTextStep || it is OcrStep ||
-                    // IF 的文字条件走 /OCRPhoto，同样需要服务端令牌
-                    (it is IfStep && it.condition == IF_CONDITION_OCR)
-            }
-        val needsCapture = allSteps.any {
-            // IF 的条件判定本身也要截屏；其余匹配/OCR/截图步骤同理
-            it is IfStep || it is MatchStep || it is PhotoMatchStep || it is OcrStep ||
-                it is SaveScreenshotStep
-        }
-        val needsGesture = allSteps.any {
-            when (it) {
-                is MatchStep -> it.tap
-                is PhotoMatchStep -> it.tap
-                is OcrStep -> it.tap
-                is AiTextStep -> it.inputResult
-                is TapStep, is SwipeStep, is InputTextStep, is GlobalActionStep -> true
-                else -> false
+    private suspend fun initialize(
+        allSteps: List<Step>,
+        target: String,
+    ): InitResult {
+        // 单次遍历收集依赖（旧实现对展开列表反复 filterIsInstance/map/any，
+        // 每项检查都会再遍历并分配一次中间列表）。
+        val templates = LinkedHashSet<String>()
+        val photoTemplates = LinkedHashSet<String>()
+        val aiSteps = ArrayList<AiTextStep>()
+        var needsServer = false
+        var needsCapture = false
+        var needsGesture = false
+
+        for (step in allSteps) {
+            when (step) {
+                is MatchStep -> {
+                    if (step.template.isNotBlank()) {
+                        templates += step.template
+                        needsServer = true
+                    }
+                    needsCapture = true
+                    if (step.tap) needsGesture = true
+                }
+
+                is PhotoMatchStep -> {
+                    if (step.template.isNotBlank()) {
+                        photoTemplates += step.template
+                        needsServer = true
+                    }
+                    needsCapture = true
+                    if (step.tap) needsGesture = true
+                }
+
+                is AiTextStep -> {
+                    aiSteps += step
+                    needsServer = true
+                    if (step.inputResult) needsGesture = true
+                }
+
+                is OcrStep -> {
+                    needsServer = true
+                    needsCapture = true
+                    if (step.tap) needsGesture = true
+                }
+
+                is IfStep -> {
+                    // IF 的条件判定本身也要截屏
+                    needsCapture = true
+                    when (step.condition) {
+                        // 服务端模板条件同样走 /See
+                        IF_CONDITION_MATCH -> if (step.template.isNotBlank()) {
+                            templates += step.template
+                            needsServer = true
+                        }
+
+                        // 本地图片模板条件走 /See_Submit_Photo
+                        IF_CONDITION_PHOTO -> if (step.template.isNotBlank()) {
+                            photoTemplates += step.template
+                            needsServer = true
+                        }
+
+                        // 文字条件走 /OCRPhoto
+                        IF_CONDITION_OCR -> needsServer = true
+                    }
+                }
+
+                is SaveScreenshotStep -> needsCapture = true
+
+                is TapStep, is SwipeStep, is InputTextStep, is GlobalActionStep ->
+                    needsGesture = true
+
+                is LaunchStep, is WaitStep -> Unit
             }
         }
 
@@ -206,10 +289,10 @@ class WorkflowEngine(
             listOf(
                 async { checkAccessibility(needsGesture) },
                 async { checkCapture(needsCapture) },
-                async { checkServer(templates, needsServer) },
-                async { checkAiPrompts(workflow) },
-                async(AppExecutors.dispatcher) { checkLaunchTargets(workflow, target) },
-                async(AppExecutors.dispatcher) { checkPhotoTemplates(photoTemplates) },
+                async { checkServer(templates.toList(), needsServer) },
+                async { checkAiPrompts(aiSteps) },
+                async(AppExecutors.dispatcher) { checkLaunchTargets(allSteps, target) },
+                async(AppExecutors.dispatcher) { checkPhotoTemplates(photoTemplates.toList()) },
             ).awaitAll()
         }
         val problems = results.flatMap { it.problems }
@@ -259,14 +342,16 @@ class WorkflowEngine(
         }
     }
 
-    private fun checkAiPrompts(workflow: Workflow): CheckResult {
-        val problems = workflow.steps.flattenSteps().filterIsInstance<AiTextStep>().mapNotNull { step ->
+    private fun checkAiPrompts(aiSteps: List<AiTextStep>): CheckResult {
+        if (aiSteps.isEmpty()) return CheckResult(true)
+        val info = identity()
+        val problems = aiSteps.mapNotNull { step ->
             when {
                 step.sections.any { IdentitySections.find(it) == null } ->
                     "AI 文案步骤包含未知身份信息段"
 
-                identity().buildPrompt(step.sections, step.instruction).isBlank() ->
-                    "AI 文案提示词为空：请先在 设置 → 身份信息 中填写内容"
+                info.buildPrompt(step.sections, step.instruction).isBlank() ->
+                    "AI 文案提示词为空：请选择提示词内容或填写补充要求，并在 设置 → 身份信息 中填写对应内容"
 
                 else -> null
             }
@@ -286,9 +371,9 @@ class WorkflowEngine(
         }
     }
 
-    private fun checkLaunchTargets(workflow: Workflow, target: String): CheckResult = try {
+    private fun checkLaunchTargets(allSteps: List<Step>, target: String): CheckResult = try {
         val problems = mutableListOf<String>()
-        workflow.steps.flattenSteps().filterIsInstance<LaunchStep>().forEach { step ->
+        allSteps.filterIsInstance<LaunchStep>().forEach { step ->
             val pkg = step.packageName.ifBlank { target }
             val launchable = pkg.isNotBlank() && context.packageManager.getLaunchIntentForPackage(pkg) != null
             if (!launchable && !step.optional) {
@@ -310,7 +395,7 @@ class WorkflowEngine(
         when (step) {
             is MatchStep -> runMatch(step, workflow.intervalMs)
             is PhotoMatchStep -> runPhotoMatch(step, workflow.intervalMs)
-            is AiTextStep -> runAiText(step, workflow.maxRetries)
+            is AiTextStep -> runAiText(step)
             is OcrStep -> runOcr(step, workflow.intervalMs)
             is IfStep -> runIf(step, fallbackPackage, workflow, prefix)
             is LaunchStep -> runLaunch(step, fallbackPackage)
@@ -319,44 +404,68 @@ class WorkflowEngine(
                 StepResult(true)
             }
 
-            is TapStep -> if (retryable(workflow.maxRetries) {
-                    AutomationAccessibilityService.tap(step.x, step.y)
-                }
-            ) StepResult(true) else StepResult(false, "无障碍点击失败（请检查服务是否开启）")
+            // 动作类单次执行；失败后由 executeSteps 按「失败重复次数」重试该步骤
+            is TapStep -> if (AutomationAccessibilityService.tap(step.x, step.y)) {
+                StepResult(true)
+            } else {
+                StepResult(false, "无障碍点击失败（请检查服务是否开启）")
+            }
 
-            is SwipeStep -> if (retryable(workflow.maxRetries) {
-                    AutomationAccessibilityService.swipe(step.x1, step.y1, step.x2, step.y2, step.durationMs)
-                }
-            ) StepResult(true) else StepResult(false, "无障碍滑动失败（请检查服务是否开启）")
+            is SwipeStep -> if (
+                AutomationAccessibilityService.swipe(step.x1, step.y1, step.x2, step.y2, step.durationMs)
+            ) {
+                StepResult(true)
+            } else {
+                StepResult(false, "无障碍滑动失败（请检查服务是否开启）")
+            }
 
-            is InputTextStep -> if (retryable(workflow.maxRetries) {
-                    AutomationAccessibilityService.inputText(step.text)
-                }
-            ) StepResult(true) else StepResult(false, "输入失败：没有可写入的输入框或无障碍未开启")
+            is InputTextStep -> if (AutomationAccessibilityService.inputText(step.text)) {
+                StepResult(true)
+            } else {
+                StepResult(false, "输入失败：没有可写入的输入框或无障碍未开启")
+            }
 
-            is GlobalActionStep -> if (retryable(workflow.maxRetries) {
-                    AutomationAccessibilityService.globalAction(step.action)
-                }
-            ) StepResult(true) else StepResult(false, "全局动作失败（请检查服务是否开启）")
+            is GlobalActionStep -> if (AutomationAccessibilityService.globalAction(step.action)) {
+                StepResult(true)
+            } else {
+                StepResult(false, "全局动作失败（请检查服务是否开启）")
+            }
 
             is SaveScreenshotStep -> runSaveScreenshot(step.tag)
         }
 
     private suspend fun runMatch(step: MatchStep, intervalMs: Long): StepResult {
+        val interval = intervalMs.coerceAtLeast(0)
         val deadline = System.currentTimeMillis() + step.timeoutMs.coerceAtLeast(0)
         var attempts = 0
         var lastDetail: String? = null
+        // 保持帧开启时，画面未变化（帧号相同）就没必要把同一张图再发给服务端：
+        // 同一帧的识别结果必然相同，直接复用上一轮结果，省掉一次大 JSON 请求。
+        var lastFrameId = -1L
+        var cachedOutcome: MatchOutcome? = null
         while (System.currentTimeMillis() < deadline) {
             currentCoroutineContext().ensureActive()
-            attempts++
-            val outcome = try {
-                see.match(capture.capturePngBase64(), step.template)
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                lastDetail = "请求异常: ${e.message}"
-                delay(intervalMs.coerceAtLeast(0))
-                continue
+            val frameId = capture.currentFrameId
+            val outcome: MatchOutcome = if (
+                frameId > 0L && frameId == lastFrameId && cachedOutcome != null
+            ) {
+                cachedOutcome!!
+            } else {
+                attempts++
+                val fresh = try {
+                    see.match(capture.capturePngBase64(), step.template)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    lastDetail = "请求异常: ${e.message}"
+                    delay(interval)
+                    continue
+                }
+                if (frameId > 0L) {
+                    lastFrameId = frameId
+                    cachedOutcome = fresh
+                }
+                fresh
             }
             when (outcome) {
                 is MatchOutcome.Found -> {
@@ -371,7 +480,7 @@ class WorkflowEngine(
 
                 is MatchOutcome.NotFound -> {
                     lastDetail = outcome.detail
-                    delay(intervalMs.coerceAtLeast(0))
+                    delay(interval)
                 }
             }
         }
@@ -383,22 +492,38 @@ class WorkflowEngine(
     }
 
     private suspend fun runPhotoMatch(step: PhotoMatchStep, intervalMs: Long): StepResult {
-        val templateBase64 = LocalTemplateStore.readBase64(context, step.template)
-            ?: return StepResult(false, "本地模板不存在: ${step.template}")
+        val templateBase64 = withContext(AppExecutors.dispatcher) {
+            LocalTemplateStore.readBase64(context, step.template)
+        } ?: return StepResult(false, "本地模板不存在: ${step.template}")
+        val interval = intervalMs.coerceAtLeast(0)
         val deadline = System.currentTimeMillis() + step.timeoutMs.coerceAtLeast(0)
         var attempts = 0
         var lastDetail: String? = null
+        var lastFrameId = -1L
+        var cachedOutcome: MatchOutcome? = null
         while (System.currentTimeMillis() < deadline) {
             currentCoroutineContext().ensureActive()
-            attempts++
-            val outcome = try {
-                see.matchPhoto(templateBase64, capture.capturePngBase64())
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                lastDetail = "请求异常: ${e.message}"
-                delay(intervalMs.coerceAtLeast(0))
-                continue
+            val frameId = capture.currentFrameId
+            val outcome: MatchOutcome = if (
+                frameId > 0L && frameId == lastFrameId && cachedOutcome != null
+            ) {
+                cachedOutcome!!
+            } else {
+                attempts++
+                val fresh = try {
+                    see.matchPhoto(templateBase64, capture.capturePngBase64())
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    lastDetail = "请求异常: ${e.message}"
+                    delay(interval)
+                    continue
+                }
+                if (frameId > 0L) {
+                    lastFrameId = frameId
+                    cachedOutcome = fresh
+                }
+                fresh
             }
             when (outcome) {
                 is MatchOutcome.Found -> {
@@ -413,7 +538,7 @@ class WorkflowEngine(
 
                 is MatchOutcome.NotFound -> {
                     lastDetail = outcome.detail
-                    delay(intervalMs.coerceAtLeast(0))
+                    delay(interval)
                 }
             }
         }
@@ -431,20 +556,33 @@ class WorkflowEngine(
     private suspend fun runOcr(step: OcrStep, intervalMs: Long): StepResult {
         val keyword = step.keyword.trim()
         if (keyword.isEmpty()) return StepResult(false, "OCR 识别文字为空")
+        val interval = intervalMs.coerceAtLeast(0)
         val deadline = System.currentTimeMillis() + step.timeoutMs.coerceAtLeast(0)
         var attempts = 0
         var lastDetail: String? = null
+        var lastFrameId = -1L
+        var cachedResults: Map<String, List<Int>>? = null
         while (System.currentTimeMillis() < deadline) {
             currentCoroutineContext().ensureActive()
-            attempts++
-            val results = try {
-                ocr.recognize(capture.capturePngBase64(), keyword)
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                lastDetail = "请求异常: ${e.message}"
-                delay(intervalMs.coerceAtLeast(0))
-                continue
+            val frameId = capture.currentFrameId
+            val results = if (frameId > 0L && frameId == lastFrameId && cachedResults != null) {
+                cachedResults!!
+            } else {
+                attempts++
+                val fresh = try {
+                    ocr.recognize(capture.capturePngBase64(), keyword)
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    lastDetail = "请求异常: ${e.message}"
+                    delay(interval)
+                    continue
+                }
+                if (frameId > 0L) {
+                    lastFrameId = frameId
+                    cachedResults = fresh
+                }
+                fresh
             }
             // 服务端已按目标文字过滤（含易混字符映射），返回的每个 key 都是命中项；
             // 这里只取第一个带坐标的结果，不能再按 keyword 做包含判断。
@@ -463,7 +601,7 @@ class WorkflowEngine(
             } else {
                 "识别结果缺少坐标: ${results.keys.take(3).joinToString()}"
             }
-            delay(intervalMs.coerceAtLeast(0))
+            delay(interval)
         }
         return StepResult(
             false,
@@ -474,7 +612,8 @@ class WorkflowEngine(
 
     /**
      * IF：条件（模板匹配 / 图片匹配 / 文字识别）在超时内成功 → 成立分支，否则 → 否则分支。
-     * 条件本身不产生失败；分支内非可选步骤失败按普通步骤失败处理（参与整条流程的失败重复）。
+     * 条件本身不产生失败（不成立只是走否则分支）；分支内步骤各自按「失败重复次数」重试，
+     * 非可选步骤重试耗尽后中止整条流程。
      */
     private suspend fun runIf(
         step: IfStep,
@@ -491,7 +630,7 @@ class WorkflowEngine(
         } catch (e: CancellationException) {
             throw e
         } catch (e: AbortException) {
-            // 可选块：跳过剩余步骤并继续；非可选块：原样上抛，由 run() 按失败重复次数重放
+            // 可选块：跳过剩余步骤并继续；非可选块：原样上抛（块内步骤已经重试过）
             if (!step.optional) throw e
             onStatusChange?.invoke("$branchLabel 内步骤失败，可选块已跳过")
         }
@@ -518,49 +657,111 @@ class WorkflowEngine(
         }
         val template = step.template
         val keyword = step.keyword.trim()
-        // 图片条件先取一次本机模板；读不到直接判为不成立
+        // 图片条件先取一次本机模板；读不到直接判为不成立（磁盘读取下沉到工作线程）
         val photoBase64 = if (step.condition == IF_CONDITION_PHOTO) {
-            LocalTemplateStore.readBase64(context, template) ?: return false
+            withContext(AppExecutors.dispatcher) {
+                LocalTemplateStore.readBase64(context, template)
+            } ?: return false
         } else {
             null
         }
+        val interval = intervalMs.coerceAtLeast(0)
         val deadline = System.currentTimeMillis() + step.timeoutMs.coerceAtLeast(0)
+        // 同 runMatch：画面未更新时复用上一轮条件结果，不重复上传同一张截图。
+        var lastFrameId = -1L
+        var cachedHit: Boolean? = null
         while (System.currentTimeMillis() < deadline) {
             currentCoroutineContext().ensureActive()
-            val hit = try {
-                when {
-                    photoBase64 != null ->
-                        see.matchPhoto(photoBase64, capture.capturePngBase64()) is MatchOutcome.Found
+            val frameId = capture.currentFrameId
+            val hit = if (frameId > 0L && frameId == lastFrameId && cachedHit != null) {
+                cachedHit!!
+            } else {
+                val fresh = try {
+                    when {
+                        photoBase64 != null ->
+                            see.matchPhoto(photoBase64, capture.capturePngBase64()) is MatchOutcome.Found
 
-                    step.condition == IF_CONDITION_MATCH ->
-                        see.match(capture.capturePngBase64(), template) is MatchOutcome.Found
+                        step.condition == IF_CONDITION_MATCH ->
+                            see.match(capture.capturePngBase64(), template) is MatchOutcome.Found
 
-                    step.condition == IF_CONDITION_OCR ->
-                        // 服务端只返回命中目标文字的条目，有带坐标的结果即条件成立
-                        ocr.recognize(capture.capturePngBase64(), keyword)
-                            .values.any { it.size >= 2 }
+                        step.condition == IF_CONDITION_OCR ->
+                            // 服务端只返回命中目标文字的条目，有带坐标的结果即条件成立
+                            ocr.recognize(capture.capturePngBase64(), keyword)
+                                .values.any { it.size >= 2 }
 
-                    else -> false
+                        else -> false
+                    }
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    delay(interval)
+                    continue
                 }
-            } catch (e: CancellationException) {
-                throw e
-            } catch (e: Exception) {
-                delay(intervalMs.coerceAtLeast(0))
-                continue
+                if (frameId > 0L) {
+                    lastFrameId = frameId
+                    cachedHit = fresh
+                }
+                fresh
             }
             if (hit) return true
-            delay(intervalMs.coerceAtLeast(0))
+            delay(interval)
         }
         return false
     }
 
-    private suspend fun runAiText(step: AiTextStep, maxRetries: Int): StepResult {
-        val prompt = identity().buildPrompt(step.sections, step.instruction)
+    /**
+     * 预取 AI 文案：把工作流里（含 IF 分支）所有 AI 文案步骤的
+     * 「提示词 + assistant 内容」组合去重后，立即交给线程池生成。
+     *
+     * 相同组合只请求一次；步骤失败重试时也直接复用已完成的结果。
+     * 生成是阻塞的长请求（最长 10 分钟），用信号量限流，避免吃满线程池影响令牌刷新等其它请求。
+     */
+    private fun startAiPrefetch(
+        allSteps: List<Step>,
+        scope: CoroutineScope,
+    ): Map<AiPrompt, Deferred<Result<String>>> {
+        val info = identity()
+        val prompts = allSteps
+            .filterIsInstance<AiTextStep>()
+            .map {
+                AiPrompt(
+                    prompt = info.buildPrompt(it.sections, it.instruction),
+                    assistant = info.buildAssistant(it.sections, it.reportType),
+                )
+            }
+            .filter { it.prompt.isNotBlank() }
+            .distinct()
+        if (prompts.isEmpty()) return emptyMap()
+        val permits = Semaphore(AI_PREFETCH_CONCURRENCY)
+        return prompts.associateWith { request ->
+            scope.async {
+                permits.withPermit {
+                    try {
+                        Result.success(aiText.generate(request.prompt, request.assistant))
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        Result.failure(e)
+                    }
+                }
+            }
+        }
+    }
+
+    private suspend fun runAiText(step: AiTextStep): StepResult {
+        val info = identity()
+        val prompt = info.buildPrompt(step.sections, step.instruction)
         if (prompt.isBlank()) {
             return StepResult(false, "提示词为空：请先在 设置 → 身份信息 中填写内容")
         }
+        val request = AiPrompt(
+            prompt = prompt,
+            assistant = info.buildAssistant(step.sections, step.reportType),
+        )
         val content = try {
-            aiText.generate(prompt)
+            // 优先取任务启动时的预取结果；相同组合只请求过一次，重试也直接复用。
+            aiPrefetches[request]?.await()?.getOrThrow()
+                ?: aiText.generate(request.prompt, request.assistant)
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -570,7 +771,7 @@ class WorkflowEngine(
             AppRepository.showHint("AI 文案已生成（${content.length} 字，未写入输入框）", HintLevel.SUCCESS)
             return StepResult(true)
         }
-        val written = retryable(maxRetries) { AutomationAccessibilityService.inputText(content) }
+        val written = AutomationAccessibilityService.inputText(content)
         return if (written) {
             AppRepository.showHint("AI 文案已生成并写入（${content.length} 字）", HintLevel.SUCCESS)
             StepResult(true)
@@ -601,11 +802,13 @@ class WorkflowEngine(
         // 直接写 PNG 字节，避免 base64 编码后再 decode 的往返
         val pngBytes = capture.capturePngBytes()
         // 经 MediaStore 存入相册 DCIM/AutoGongxueyun（相册/文件管理直接可见，无需存储权限）
-        ScreenshotStore.savePng(
-            context,
-            "${System.currentTimeMillis()}_$tag.png",
-            pngBytes,
-        )
+        withContext(AppExecutors.dispatcher) {
+            ScreenshotStore.savePng(
+                context,
+                "${System.currentTimeMillis()}_$tag.png",
+                pngBytes,
+            )
+        }
         StepResult(true)
     } catch (e: CancellationException) {
         throw e
@@ -613,22 +816,16 @@ class WorkflowEngine(
         StepResult(false, "截图存证失败: ${e.message}")
     }
 
-    private suspend fun retryable(times: Int, block: suspend () -> Boolean): Boolean {
-        val total = times.coerceAtLeast(1)
-        repeat(total) { attempt ->
-            currentCoroutineContext().ensureActive()
-            if (block()) return true
-            if (attempt < total - 1) delay(RETRY_DELAY_MS)
-        }
-        return false
-    }
-
     private fun describe(step: Step): String = when (step) {
         is LaunchStep -> "拉起 ${step.packageName.ifBlank { "<全局目标>" }}"
         is WaitStep -> "等待 ${step.ms}ms"
         is MatchStep -> "匹配「${step.template}」${if (step.tap) " + 点击" else ""}"
         is PhotoMatchStep -> "图片匹配「${step.template}」${if (step.tap) " + 点击" else ""}"
-        is AiTextStep -> "AI 文案（${step.sections.size} 段身份信息）"
+        is AiTextStep -> buildString {
+            append("AI 文案")
+            ReportTypes.label(step.reportType).takeIf { it.isNotBlank() }?.let { append(" · $it") }
+            append("（${step.sections.size} 段提示词内容）")
+        }
         is OcrStep -> "识别文字「${step.keyword}」${if (step.tap) " + 点击" else ""}"
         is IfStep -> buildString {
             val kind = when (step.condition) {
@@ -661,12 +858,13 @@ class WorkflowEngine(
         workflow.effectiveTargetPackage.ifBlank { fallbackPackage.trim() }
 
     private companion object {
+        /** 步骤级重试前的缓冲；给目标应用/界面一点时间恢复到可操作状态 */
         const val RETRY_DELAY_MS = 500L
-
-        /** 整条流程失败重试前的缓冲；给目标应用一点时间恢复到可操作状态 */
-        const val WORKFLOW_RETRY_DELAY_MS = 1500L
 
         /** 初始化帧池预热上限：等待投屏首帧到达 */
         const val FIRST_FRAME_TIMEOUT_MS = ScreenCaptureManager.FIRST_FRAME_TIMEOUT_MS
+
+        /** AI 文案预取的并发上限：生成长请求会阻塞线程，留出线程给令牌/其它接口 */
+        const val AI_PREFETCH_CONCURRENCY = 2
     }
 }

@@ -29,6 +29,9 @@ object LocalTemplateStore {
     private const val DIR_NAME = "photo_templates"
     private const val SUFFIX = ".img"
 
+    /** 文件名非法字符：只编译一次（suggestedName/sanitize 会被列表与导入反复调用）。 */
+    private val INVALID_NAME_CHARS = Regex("""[\\/:*?"<>|]""")
+
     /** 模板图片最长边上限：超过通常是整张相册照片，既不适合做模板也容易 OOM */
     const val MAX_EDGE = 4096
 
@@ -39,7 +42,7 @@ object LocalTemplateStore {
 
     fun sanitize(name: String): String =
         name.trim()
-            .replace(Regex("""[\\/:*?"<>|]"""), "_")
+            .replace(INVALID_NAME_CHARS, "_")
             .trim('.', ' ')
             .ifBlank { "模板_${System.currentTimeMillis()}" }
 

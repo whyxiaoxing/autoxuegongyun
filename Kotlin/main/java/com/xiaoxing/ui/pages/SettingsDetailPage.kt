@@ -20,18 +20,22 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.ime
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.union
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -56,6 +60,7 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.ScaffoldDefaults
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
@@ -83,6 +88,7 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -99,7 +105,11 @@ import com.xiaoxing.accessibility.AutomationAccessibilityService
 import com.xiaoxing.config.IdentityInfo
 import com.xiaoxing.config.IdentitySections
 import com.xiaoxing.config.MATCH_CONFIDENCE_RANGE
+import com.xiaoxing.concurrent.AppExecutors
 import com.xiaoxing.config.ThemeMode
+import com.xiaoxing.log.AppLog
+import com.xiaoxing.log.LogLevel
+import com.xiaoxing.log.LogRecord
 import com.xiaoxing.permissions.PermissionMonitor
 import com.xiaoxing.photo.LocalTemplate
 import com.xiaoxing.photo.LocalTemplateStore
@@ -131,6 +141,7 @@ internal fun SettingsDetailPage(
         SettingsDestination.PERMISSIONS -> PermissionsSettingsDetail(onBack)
         SettingsDestination.AUTOMATION -> AutomationSettingsDetail(onBack)
         SettingsDestination.ALERTS -> AlertSettingsDetail(onBack)
+        SettingsDestination.LOG -> LogSettingsDetail(onBack)
         SettingsDestination.APPEARANCE -> AppearanceSettingsDetail(onBack)
         SettingsDestination.ABOUT -> AboutSettingsDetail(onBack)
     }
@@ -146,6 +157,11 @@ internal fun DetailScaffold(
 ) {
     Scaffold(
         containerColor = Color.Transparent,
+        // 详情页几乎都是可滚动表单；edge-to-edge 下 adjustResize 不会缩窗口，
+        // 不把 IME 计入内容内边距的话输入框会被键盘盖住。
+        // 这里把 IME 并入 Scaffold 内边距后，滚动容器的视口会随键盘缩小，
+        // 聚焦的输入框由 Compose 自动滚到键盘上方。
+        contentWindowInsets = ScaffoldDefaults.contentWindowInsets.union(WindowInsets.ime),
         topBar = {
             TopAppBar(
                 title = {
@@ -783,11 +799,14 @@ private fun IdentitySettingsDetail(onBack: () -> Unit) {
     var dailyReport by rememberSaveable(identity.dailyReport) { mutableStateOf(identity.dailyReport) }
     var weeklyReport by rememberSaveable(identity.weeklyReport) { mutableStateOf(identity.weeklyReport) }
     var monthlyReport by rememberSaveable(identity.monthlyReport) { mutableStateOf(identity.monthlyReport) }
+    var assistantIdentity by rememberSaveable(identity.assistantIdentity) {
+        mutableStateOf(identity.assistantIdentity)
+    }
     var saving by remember { mutableStateOf(false) }
 
     DetailScaffold(
         title = "身份信息",
-        subtitle = "AI 文案步骤的提示词素材",
+        subtitle = "AI 文案的 assistant 身份与提示词素材",
         onBack = onBack,
     ) {
         Column(
@@ -829,6 +848,19 @@ private fun IdentitySettingsDetail(onBack: () -> Unit) {
                     maxLines = 4,
                     modifier = Modifier.fillMaxWidth(),
                 )
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text("默认发送到 assistant", style = MaterialTheme.typography.bodyMedium)
+                        Text(
+                            "实习单位与身份描述作为 assistant 内容发送；" +
+                                "关闭后只发送报告类型（如「这是一份周报」）。",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                    Spacer(Modifier.width(12.dp))
+                    Switch(checked = assistantIdentity, onCheckedChange = { assistantIdentity = it })
+                }
             }
 
             AppPanelColumn {
@@ -883,6 +915,7 @@ private fun IdentitySettingsDetail(onBack: () -> Unit) {
                                 dailyReport = dailyReport,
                                 weeklyReport = weeklyReport,
                                 monthlyReport = monthlyReport,
+                                assistantIdentity = assistantIdentity,
                             ),
                         )
                             .onSuccess {
@@ -903,7 +936,8 @@ private fun IdentitySettingsDetail(onBack: () -> Unit) {
             }
 
             Text(
-                "内容只保存在本机，并随提示词发送给自建服务端的 /AiText 路由。空白段在拼接时会自动跳过。",
+                "内容只保存在本机，并随 assistant 内容 / 提示词发送给自建服务端的 /AiText 路由。" +
+                    "空白段在拼接时会自动跳过。",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -911,6 +945,131 @@ private fun IdentitySettingsDetail(onBack: () -> Unit) {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Runtime log
+// ---------------------------------------------------------------------------
+
+/**
+ * 运行日志：只展示进程内的 [AppLog] 环形缓冲，不读文件、不落盘。
+ *
+ * 列表用 `reverseLayout = true` + 倒序数据：最新一条固定在底部，
+ * 新日志进来时视图天然停在最新位置，不需要自动滚动。
+ */
+@Composable
+private fun LogSettingsDetail(onBack: () -> Unit) {
+    val records by AppLog.records.collectAsStateWithLifecycle()
+    // 倒序视图只随日志快照变化重建，避免每次重组都重新包装一次列表
+    val displayRecords = remember(records) { records.asReversed() }
+
+    DetailScaffold(
+        title = "运行日志",
+        subtitle = "仅保存在内存，退出应用后清空",
+        onBack = onBack,
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(horizontal = 18.dp, vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(
+                    "本次运行 ${records.size} 条（最多 ${AppLog.MAX_ENTRIES} 条）",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.weight(1f),
+                )
+                TextButton(onClick = { AppLog.clear() }, enabled = records.isNotEmpty()) {
+                    Text("清空")
+                }
+            }
+
+            if (records.isEmpty()) {
+                AppPanelColumn(Modifier.fillMaxWidth()) {
+                    Text("暂无运行日志", style = MaterialTheme.typography.titleSmall)
+                    Text(
+                        "启动一次自动化后，这里会按时间顺序显示工作流步骤、投屏状态与错误原因。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            } else {
+                AppPanel(
+                    Modifier
+                        .fillMaxWidth()
+                        .weight(1f),
+                ) {
+                    LazyColumn(
+                        modifier = Modifier.fillMaxSize(),
+                        reverseLayout = true,
+                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 10.dp),
+                        verticalArrangement = Arrangement.spacedBy(9.dp),
+                    ) {
+                        items(displayRecords, key = { it.id }) { record ->
+                            LogRow(record)
+                        }
+                    }
+                }
+            }
+
+            Text(
+                "日志只写入内存环形缓冲：不写文件、不上传；进程被杀死或重启后自动清空。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+@Composable
+private fun LogRow(record: LogRecord) {
+    val scheme = MaterialTheme.colorScheme
+    val accent = when (record.level) {
+        LogLevel.DEBUG -> scheme.onSurfaceVariant
+        LogLevel.INFO -> scheme.primary
+        LogLevel.WARN -> AppTheme.extended.warning
+        LogLevel.ERROR -> scheme.error
+    }
+    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                record.timeText,
+                style = MaterialTheme.typography.labelSmall,
+                fontFamily = FontFamily.Monospace,
+                color = scheme.onSurfaceVariant,
+            )
+            Spacer(Modifier.width(8.dp))
+            Text(
+                record.level.label,
+                style = MaterialTheme.typography.labelSmall,
+                color = accent,
+            )
+            Spacer(Modifier.width(8.dp))
+            Text(
+                record.tag,
+                style = MaterialTheme.typography.labelSmall,
+                color = scheme.onSurfaceVariant,
+            )
+        }
+        // 允许长按选中复制错误信息
+        SelectionContainer {
+            Text(
+                record.message,
+                style = MaterialTheme.typography.bodySmall,
+                color = scheme.onSurface,
+            )
+        }
+    }
+}
+
+private val LogLevel.label: String
+    get() = when (this) {
+        LogLevel.DEBUG -> "调试"
+        LogLevel.INFO -> "信息"
+        LogLevel.WARN -> "警告"
+        LogLevel.ERROR -> "错误"
+    }
 
 // ---------------------------------------------------------------------------
 // Local photo templates
@@ -927,8 +1086,11 @@ private fun PhotoTemplateSettingsDetail(onBack: () -> Unit) {
     var toDelete by remember { mutableStateOf<LocalTemplate?>(null) }
     var busy by remember { mutableStateOf(false) }
 
+    // 目录列举/文件属性读取放到工作线程，避免打开页面或删除模板时在主线程做磁盘 IO
     fun reload() {
-        templates = LocalTemplateStore.list(context)
+        scope.launch {
+            templates = withContext(AppExecutors.dispatcher) { LocalTemplateStore.list(context) }
+        }
     }
 
     LaunchedEffect(context) { reload() }

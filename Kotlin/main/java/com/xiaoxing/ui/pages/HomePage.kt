@@ -110,7 +110,11 @@ internal fun HomePage(
         }
     }
 
-    val selectedSummaries = summaries.filter { it.name in selectedNames }
+    // 摘要列表可能较大，选中集合与过滤结果都缓存到输入变化为止（列表成员判断改为 O(1)）
+    val selectedNameSet = remember(selectedNames) { selectedNames.toHashSet() }
+    val selectedSummaries = remember(summaries, selectedNameSet) {
+        summaries.filter { it.name in selectedNameSet }
+    }
 
     Column(
         modifier = Modifier
@@ -566,6 +570,12 @@ private fun WorkflowPickerDialog(
     onConfirm: (List<String>) -> Unit,
 ) {
     var draft by remember(selected) { mutableStateOf(selected) }
+    // 勾选序号与摘要都预计算：旧实现对每个列表项分别做 indexOf / firstOrNull，
+    // 流程多时选择器是 O(n²) 扫描。
+    val orderByName = remember(draft) {
+        draft.withIndex().associate { (index, name) -> name to index }
+    }
+    val summaryByName = remember(summaries) { summaries.associateBy { it.name } }
 
     Dialog(
         onDismissRequest = onDismiss,
@@ -620,10 +630,10 @@ private fun WorkflowPickerDialog(
                         verticalArrangement = Arrangement.spacedBy(6.dp),
                     ) {
                         items(workflows, key = { it }) { name ->
-                            val order = draft.indexOf(name)
+                            val order = orderByName[name] ?: -1
                             WorkflowPickRow(
                                 name = name,
-                                summary = summaries.firstOrNull { it.name == name },
+                                summary = summaryByName[name],
                                 order = order,
                                 onClick = {
                                     draft = if (order >= 0) {

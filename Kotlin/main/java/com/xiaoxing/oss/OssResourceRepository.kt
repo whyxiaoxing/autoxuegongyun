@@ -86,7 +86,17 @@ object OssResourceRepository {
             response.body?.bytes() ?: error("空响应体: $url")
         }
 
-    private fun sha256(bytes: ByteArray): String =
-        MessageDigest.getInstance("SHA-256").digest(bytes)
-            .joinToString("") { "%02x".format(it) }
+    private val hexDigits = "0123456789abcdef".toCharArray()
+
+    /** 手工转十六进制：避免 `"%02x".format()` 每个字节都做一次格式化和字符串分配。 */
+    private fun sha256(bytes: ByteArray): String {
+        val digest = MessageDigest.getInstance("SHA-256").digest(bytes)
+        val out = CharArray(digest.size * 2)
+        for (i in digest.indices) {
+            val value = digest[i].toInt() and 0xFF
+            out[i * 2] = hexDigits[value ushr 4]
+            out[i * 2 + 1] = hexDigits[value and 0x0F]
+        }
+        return String(out)
+    }
 }

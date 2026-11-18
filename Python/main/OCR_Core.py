@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 import os
 import subprocess
-from _dataclass import 程序路径,_功能函数
+from _dataclass import 程序路径
 import ExpandGXYxiaoxing
-
+from Function_One import Function_One
 
 
 TESSERACT路径 = 程序路径 / "tesseract" / "tesseract.exe"
@@ -33,7 +33,7 @@ def 光学文字识别(
         raise FileNotFoundError(f"找不到 Tesseract: {TESSERACT路径}")
     if not TESSDATA路径.is_dir():
         raise FileNotFoundError(f"找不到 tessdata: {TESSDATA路径}")
-    图片=_功能函数.图片解码(图片)
+    图片=Function_One.图片解码(图片)
     命令 = [
         str(TESSERACT路径),
         "stdin",
