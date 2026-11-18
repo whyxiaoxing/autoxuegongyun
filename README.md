@@ -16,7 +16,9 @@
 > 如果有BUG需要你的提交与返回
 
 1. 下载前后端安装包 [下载地址](https://github.com/whyxiaoxing/autoxuegongyun/releases/latest)  分别进行安装
-2. 安装好前后端 并配置后端的`Config.json文件`，[后端安装指南点击我跳转](!)[移动端安装指南](!)
+2. 安装好前后端 并配置后端的`Config.json文件`<br>
+[后端安装指南点击我跳转](https://github.com/whyxiaoxing/autoxuegongyun/blob/main/docs/Backend.md)<br>
+[移动端安装指南](https://github.com/whyxiaoxing/autoxuegongyun/blob/main/docs/Android.md)
 3. 运行 `gongxueyunAuto.exe` 程序
 4. 打开移动端APP 进入设置界面
 5. 点击`服务器链接` 输入服务器端口和IP，点击保存
